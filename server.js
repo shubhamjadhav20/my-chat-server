@@ -7,11 +7,14 @@ app.use(cors());
 app.use(express.json());
 
 // Railway loads JSON from env
-const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_KEY);
+const serviceAccount = JSON.parse(
+  Buffer.from(process.env.SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
+);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
+
 
 // Default test route
 app.get("/", (req, res) => {
