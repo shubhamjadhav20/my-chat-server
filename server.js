@@ -15,16 +15,19 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-
 // Default test route
 app.get("/", (req, res) => {
   res.send("Chat Server is running on Railway 🚀");
 });
 
-// Send chat message notification
+// ============================================================================
+// FIXED: Send chat message notification
+// ============================================================================
 app.post("/sendChatMessage", async (req, res) => {
   try {
     const { senderId, message } = req.body;
+    
+    console.log(`📨 Incoming message from ${senderId}: ${message}`);
 
     // Determine recipient
     const receiverId = senderId === "user1" ? "user2" : "user1";
@@ -37,32 +40,155 @@ app.post("/sendChatMessage", async (req, res) => {
       .get();
 
     if (!tokenDoc.exists) {
+      console.log(`❌ No FCM token found for ${receiverId}`);
       return res.json({ success: false, error: "No token found for receiver" });
     }
 
     const token = tokenDoc.data().token;
+    console.log(`✅ Found token for ${receiverId}: ${token.substring(0, 20)}...`);
+
+    // ✅ CRITICAL FIX: Include BOTH notification AND data fields
+    const payload = {
+      token,
+      
+      // This makes notifications work when app is killed/background
+      notification: {
+        title: "New Message",
+        body: message.length > 100 ? message.substring(0, 100) + "..." : message
+      },
+      
+      // Additional data for app processing
+      data: {
+        senderId: senderId,
+        message: message,
+        timestamp: Date.now().toString(),
+        type: "chat_message"
+      },
+      
+      // Android-specific configuration
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "chat_messages_high", // Matches your app's channel
+          sound: "default",
+          priority: "high",
+          defaultSound: true,
+          defaultVibrateTimings: false // Your app handles vibration
+        }
+      }
+    };
+
+    console.log(`📤 Sending notification to ${receiverId}...`);
+    const response = await admin.messaging().send(payload);
+    console.log(`✅ Notification sent successfully: ${response}`);
+
+    return res.json({ success: true, messageId: response });
+    
+  } catch (error) {
+    console.error("❌ Error sending notification:", error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || "Unknown error" 
+    });
+  }
+});
+
+// ============================================================================
+// OPTIONAL: Test endpoint to send notification to a specific token
+// ============================================================================
+app.post("/testNotification", async (req, res) => {
+  try {
+    const { token, title, message } = req.body;
+
+    if (!token) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Token is required" 
+      });
+    }
 
     const payload = {
       token,
+      notification: {
+        title: title || "Test Notification",
+        body: message || "This is a test notification from your server"
+      },
       data: {
-        title: "New message",
-        body: message
+        test: "true",
+        timestamp: Date.now().toString()
       },
       android: {
-        priority: "high"
+        priority: "high",
+        notification: {
+          channelId: "chat_messages_high"
+        }
       }
     };
 
     const response = await admin.messaging().send(payload);
+    console.log(`✅ Test notification sent: ${response}`);
 
-    return res.json({ success: true, response });
+    return res.json({ success: true, messageId: response });
+    
   } catch (error) {
-    console.error("Error sending notification:", error);
-    return res.status(500).json({ success: false, error });
+    console.error("❌ Error sending test notification:", error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
   }
 });
 
+// ============================================================================
+// OPTIONAL: Save FCM token endpoint (for your app to register tokens)
+// ============================================================================
+app.post("/saveFCMToken", async (req, res) => {
+  try {
+    const { userId, token } = req.body;
+
+    if (!userId || !token) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "userId and token are required" 
+      });
+    }
+
+    await admin
+      .firestore()
+      .collection("fcm_tokens")
+      .doc(userId)
+      .set({
+        token: token,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    console.log(`✅ Token saved for ${userId}`);
+    return res.json({ success: true });
+    
+  } catch (error) {
+    console.error("❌ Error saving token:", error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// ============================================================================
+// Health check endpoint
+// ============================================================================
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
 // Railway uses PORT env variable
-app.listen(process.env.PORT || 3000, () =>
-  console.log("🔥 Server running on Railway")
-);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🔥 Server running on port ${PORT}`);
+  console.log(`🚀 Railway deployment active`);
+  console.log(`📱 Ready to send notifications!`);
+});
