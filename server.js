@@ -229,6 +229,46 @@ app.post("/saveFCMToken", async (req, res) => {
     });
   }
 });
+// NEW: Get signed download URL for B2 file
+app.post("/getSignedUrl", async (req, res) => {
+  try {
+    const { fileName } = req.body;
+
+    if (!fileName) {
+      return res.status(400).json({
+        success: false,
+        error: "fileName is required",
+      });
+    }
+
+    // Re-authorize if needed
+    if (!b2Authorized) {
+      await authorizeB2();
+    }
+
+    // Get download authorization
+    const downloadAuth = await b2.getDownloadAuthorization({
+      bucketId: process.env.B2_BUCKET_ID,
+      fileNamePrefix: fileName,
+      validDurationInSeconds: 86400, // 24 hours
+    });
+
+    const signedUrl = `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
+
+    console.log(`✅ Signed URL generated for ${fileName}`);
+
+    return res.json({
+      success: true,
+      signedUrl: signedUrl,
+    });
+  } catch (error) {
+    console.error("❌ Error getting signed URL:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
 
 // ============================================================================
 // Health check endpoint
