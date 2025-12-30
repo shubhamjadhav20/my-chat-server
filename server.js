@@ -92,6 +92,47 @@ app.post("/sendChatMessage", async (req, res) => {
     });
   }
 });
+app.post("/markAsSeen", async (req, res) => {
+  try {
+    const { messageIds } = req.body;
+    
+    if (!messageIds || !Array.isArray(messageIds)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "messageIds array is required" 
+      });
+    }
+
+    // Batch update messages
+    const batch = admin.firestore().batch();
+    
+    messageIds.forEach(msgId => {
+      const msgRef = admin.firestore()
+        .collection("rooms")
+        .doc("room1")
+        .collection("messages")
+        .doc(msgId);
+      
+      batch.update(msgRef, { 
+        seen: true, 
+        status: "seen",
+        seenAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    });
+    
+    await batch.commit();
+    console.log(`✅ Marked ${messageIds.length} messages as seen`);
+    
+    return res.json({ success: true, count: messageIds.length });
+    
+  } catch (error) {
+    console.error("❌ Error marking messages as seen:", error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
 
 // ============================================================================
 // OPTIONAL: Test endpoint to send notification to a specific token
