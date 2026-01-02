@@ -115,51 +115,41 @@ app.post("/sendChatMessage", async (req, res) => {
     const { senderId, message } = req.body;
     
     console.log(`📨 Incoming message from ${senderId}: ${message}`);
-
     const receiverId = senderId === "user1" ? "user2" : "user1";
-
+    
     const tokenDoc = await admin
       .firestore()
       .collection("fcm_tokens")
       .doc(receiverId)
       .get();
-
+      
     if (!tokenDoc.exists) {
       console.log(`❌ No FCM token found for ${receiverId}`);
       return res.json({ success: false, error: "No token found for receiver" });
     }
-
+    
     const token = tokenDoc.data().token;
     console.log(`✅ Found token for ${receiverId}`);
-
+    
+    // FIXED: Removed android.notification completely
     const payload = {
       token,
-      // notification: {
-      //   title: "New Message",
-      //   body: message.length > 100 ? message.substring(0, 100) + "..." : message,
-      // },
       data: {
         senderId: senderId,
         message: message,
-        timestamp: Date.now().toString(),  // This is already here, just make sure it's present
+        timestamp: Date.now().toString(),
         type: "chat_message",
       },
       android: {
-        priority: "high",
-        notification: {
-          channelId: "chat_messages_high",
-          sound: "default",
-          priority: "high",
-          defaultSound: true,
-          defaultVibrateTimings: false,
-        },
+        priority: "high"
+        // ❌ REMOVED android.notification - let MyFirebaseService handle it
       },
     };
-
+    
     console.log(`📤 Sending notification to ${receiverId}...`);
     const response = await admin.messaging().send(payload);
     console.log(`✅ Notification sent successfully`);
-
+    
     return res.json({ success: true, messageId: response });
     
   } catch (error) {
