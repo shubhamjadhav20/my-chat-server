@@ -113,7 +113,7 @@ app.post("/getUploadAuth", async (req, res) => {
 app.post("/sendChatMessage", async (req, res) => {
   try {
     const { senderId, message } = req.body;
-
+    
     console.log(`📨 Incoming message from ${senderId}: ${message}`);
 
     const receiverId = senderId === "user1" ? "user2" : "user1";
@@ -141,7 +141,7 @@ app.post("/sendChatMessage", async (req, res) => {
       data: {
         senderId: senderId,
         message: message,
-        timestamp: Date.now().toString(),
+        timestamp: Date.now().toString(),  // This is already here, just make sure it's present
         type: "chat_message",
       },
       android: {
@@ -161,15 +161,15 @@ app.post("/sendChatMessage", async (req, res) => {
     console.log(`✅ Notification sent successfully`);
 
     return res.json({ success: true, messageId: response });
+    
   } catch (error) {
     console.error("❌ Error sending notification:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message || "Unknown error",
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || "Unknown error" 
     });
   }
 });
-
 // ============================================================================
 // Test notification endpoint
 // ============================================================================
