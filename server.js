@@ -134,10 +134,10 @@ app.post("/sendChatMessage", async (req, res) => {
 
     const payload = {
       token,
-      notification: {
-        title: "New Message",
-        body: message.length > 100 ? message.substring(0, 100) + "..." : message,
-      },
+      // notification: {
+      //   title: "New Message",
+      //   body: message.length > 100 ? message.substring(0, 100) + "..." : message,
+      // },
       data: {
         senderId: senderId,
         message: message,
