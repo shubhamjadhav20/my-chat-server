@@ -61,24 +61,43 @@ app.post("/getUploadAuth", async (req, res) => {
       });
     }
 
-    // Re-authorize if needed
-    if (!b2Authorized) {
-      await authorizeB2();
+    // Try to get upload URL
+    try {
+      const uploadUrlResponse = await b2.getUploadUrl({
+        bucketId: process.env.B2_BUCKET_ID,
+      });
+
+      console.log(`✅ Upload URL generated for ${userId}`);
+
+      return res.json({
+        success: true,
+        uploadUrl: uploadUrlResponse.data.uploadUrl,
+        authorizationToken: uploadUrlResponse.data.authorizationToken,
+        bucketName: process.env.B2_BUCKET_NAME,
+      });
+    } catch (uploadError) {
+      // If expired token, re-authorize and retry
+      if (uploadError.status === 401 || uploadError.data?.code === 'expired_auth_token') {
+        console.log("⚠️ Token expired, re-authorizing...");
+        await authorizeB2();
+        
+        // Retry after re-authorization
+        const uploadUrlResponse = await b2.getUploadUrl({
+          bucketId: process.env.B2_BUCKET_ID,
+        });
+
+        console.log(`✅ Upload URL generated after re-auth for ${userId}`);
+
+        return res.json({
+          success: true,
+          uploadUrl: uploadUrlResponse.data.uploadUrl,
+          authorizationToken: uploadUrlResponse.data.authorizationToken,
+          bucketName: process.env.B2_BUCKET_NAME,
+        });
+      } else {
+        throw uploadError;
+      }
     }
-
-    // Get upload URL for the bucket
-    const uploadUrlResponse = await b2.getUploadUrl({
-      bucketId: process.env.B2_BUCKET_ID,
-    });
-
-    console.log(`✅ Upload URL generated for ${userId}`);
-
-    return res.json({
-      success: true,
-      uploadUrl: uploadUrlResponse.data.uploadUrl,
-      authorizationToken: uploadUrlResponse.data.authorizationToken,
-      bucketName: process.env.B2_BUCKET_NAME,
-    });
   } catch (error) {
     console.error("❌ Error getting upload auth:", error);
     return res.status(500).json({
