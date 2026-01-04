@@ -160,6 +160,46 @@ app.post("/sendChatMessage", async (req, res) => {
     });
   }
 });
+
+app.post("/sendCallNotification", async (req, res) => {
+  try {
+    const { callerId, calleeId, callType, callId } = req.body;
+    
+    const tokenDoc = await admin.firestore()
+      .collection("fcm_tokens")
+      .doc(calleeId)
+      .get();
+    
+    if (!tokenDoc.exists) {
+      return res.json({ success: false, error: "No token" });
+    }
+    
+    const token = tokenDoc.data().token;
+    const callerName = callerId === "user1" ? "Shubham" : "Prachiti";
+    
+    const payload = {
+      token,
+      data: {
+        type: "incoming_call",
+        callerId: callerId,
+        calleeId: calleeId,
+        callType: callType,
+        callId: callId,
+        callerName: callerName
+      },
+      android: {
+        priority: "high"
+      }
+    };
+    
+    const response = await admin.messaging().send(payload);
+    return res.json({ success: true, messageId: response });
+    
+  } catch (error) {
+    console.error("Error sending call notification:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
 // ============================================================================
 // Test notification endpoint
 // ============================================================================
