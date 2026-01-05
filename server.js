@@ -117,6 +117,7 @@ app.post("/sendChatMessage", async (req, res) => {
     console.log(`📨 Incoming message from ${senderId}: ${message}`);
     const receiverId = senderId === "user1" ? "user2" : "user1";
     
+    // Try to get FCM token
     const tokenDoc = await admin
       .firestore()
       .collection("fcm_tokens")
@@ -124,14 +125,27 @@ app.post("/sendChatMessage", async (req, res) => {
       .get();
       
     if (!tokenDoc.exists) {
-      console.log(`❌ No FCM token found for ${receiverId}`);
-      return res.json({ success: false, error: "No token found for receiver" });
+      console.log(`⚠️ No FCM token found for ${receiverId} - message delivered via Firestore`);
+      // Return 200 success - message was still delivered via Firestore
+      return res.status(200).json({ 
+        success: true, 
+        message: "Message delivered, notification skipped (no token)" 
+      });
     }
     
     const token = tokenDoc.data().token;
+    
+    if (!token) {
+      console.log(`⚠️ Empty FCM token for ${receiverId}`);
+      return res.status(200).json({ 
+        success: true, 
+        message: "Message delivered, notification skipped (empty token)" 
+      });
+    }
+    
     console.log(`✅ Found token for ${receiverId}`);
     
-    // FIXED: Removed android.notification completely
+    // Send notification
     const payload = {
       token,
       data: {
@@ -142,21 +156,46 @@ app.post("/sendChatMessage", async (req, res) => {
       },
       android: {
         priority: "high"
-        // ❌ REMOVED android.notification - let MyFirebaseService handle it
       },
     };
     
-    console.log(`📤 Sending notification to ${receiverId}...`);
-    const response = await admin.messaging().send(payload);
-    console.log(`✅ Notification sent successfully`);
-    
-    return res.json({ success: true, messageId: response });
+    try {
+      console.log(`📤 Sending notification to ${receiverId}...`);
+      const response = await admin.messaging().send(payload);
+      console.log(`✅ Notification sent successfully: ${response}`);
+      
+      return res.status(200).json({ 
+        success: true, 
+        messageId: response 
+      });
+      
+    } catch (fcmError) {
+      // FCM failed, but message was still delivered via Firestore
+      console.error(`⚠️ FCM send failed: ${fcmError.message}`);
+      
+      // Check if token is invalid and needs cleanup
+      if (fcmError.code === 'messaging/invalid-registration-token' || 
+          fcmError.code === 'messaging/registration-token-not-registered') {
+        console.log(`🗑️ Cleaning up invalid token for ${receiverId}`);
+        await admin.firestore().collection("fcm_tokens").doc(receiverId).delete();
+      }
+      
+      // Still return 200 - message was delivered
+      return res.status(200).json({ 
+        success: true, 
+        message: "Message delivered, notification failed",
+        fcmError: fcmError.message 
+      });
+    }
     
   } catch (error) {
-    console.error("❌ Error sending notification:", error);
-    return res.status(500).json({ 
-      success: false, 
-      error: error.message || "Unknown error" 
+    console.error("❌ Error in sendChatMessage:", error);
+    
+    // Return 200 even on error - message was delivered via Firestore
+    return res.status(200).json({ 
+      success: true, 
+      message: "Message delivered, notification processing failed",
+      error: error.message 
     });
   }
 });
