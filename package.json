@@ -7,9 +7,12 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "backblaze-b2": "^1.7.1",
     "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
     "express": "^4.18.2",
     "firebase-admin": "^12.0.0",
-    "backblaze-b2": "^1.7.1"
+    "mongoose": "^9.1.5",
+    "socket.io": "^4.8.3"
   }
 }

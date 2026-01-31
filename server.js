@@ -2,12 +2,105 @@ import express from "express";
 import admin from "firebase-admin";
 import cors from "cors";
 import B2 from "backblaze-b2";
+import mongoose from "mongoose";       // NEW
+import { createServer } from "http";   // NEW
+import { Server } from "socket.io";    // NEW
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Firebase setup
+// ============================================================================
+// 1. HYBRID SETUP: DATABASE & SOCKETS (THE NEW BRAIN) 🧠
+// ============================================================================
+
+// Connect to MongoDB
+// On Render, this uses the Environment Variable. Locally, it defaults to localhost.
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/chat_app";
+
+mongoose.connect(MONGO_URI)
+  .then(() => console.log("✅ Connected to MongoDB"))
+  .catch(err => console.error("❌ MongoDB Connection Error:", err));
+
+// Define Schemas (Strict typing for your new data)
+const MessageSchema = new mongoose.Schema({
+  docId: { type: String, required: true, unique: true },
+  text: String,
+  senderId: String,
+  timestamp: Number,
+  seen: { type: Boolean, default: false },
+  status: { type: String, default: "sent" },
+  mediaUrl: String,
+  mediaType: String,
+  replyToMessageId: String,
+  roomId: { type: String, default: "room1" }
+});
+
+const UserSchema = new mongoose.Schema({
+  userId: { type: String, required: true, unique: true },
+  fcmToken: String,
+  isOnline: Boolean,
+  lastSeen: Number
+});
+
+const Message = mongoose.model('Message', MessageSchema);
+const User = mongoose.model('User', UserSchema);
+
+// Setup Socket.io wrapped around Express
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: "*" }
+});
+
+// Socket Logic (Runs parallel to your REST API)
+io.on('connection', (socket) => {
+  console.log(`🔌 Socket Connected: ${socket.id}`);
+
+  // 1. Join Room
+  socket.on('join', async ({ userId, roomId }) => {
+    socket.join(roomId);
+    socket.userId = userId;
+    await User.findOneAndUpdate({ userId }, { isOnline: true, lastSeen: Date.now() }, { upsert: true });
+    socket.to(roomId).emit('presence_update', { userId, isOnline: true });
+  });
+
+  // 2. Send Message (New Flow)
+  socket.on('send_message', async (data) => {
+    try {
+      // Save to Mongo
+      const newMsg = new Message(data);
+      await newMsg.save();
+
+      // Emit to room
+      io.to(data.roomId).emit('new_message', data);
+      socket.emit('message_sent', { docId: data.docId, status: 'sent' });
+
+      // Trigger Notification (Reuse existing logic!)
+      const receiverId = data.senderId === "user1" ? "user2" : "user1";
+      await sendFCM(data.senderId, receiverId, data.text || "New Message");
+
+    } catch (e) {
+      console.error("Socket Save Error:", e);
+    }
+  });
+
+  // 3. Typing (Volatile)
+  socket.on('typing', ({ roomId, isTyping }) => {
+    socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
+  });
+
+  socket.on('disconnect', async () => {
+    if (socket.userId) {
+      await User.findOneAndUpdate({ userId: socket.userId }, { isOnline: false, lastSeen: Date.now() });
+      io.emit('presence_update', { userId: socket.userId, isOnline: false });
+    }
+  });
+});
+
+// ============================================================================
+// 2. EXISTING CONFIGURATION (FIREBASE & B2) - UNCHANGED 🛡️
+// ============================================================================
+
 const serviceAccount = JSON.parse(
   Buffer.from(process.env.SERVICE_ACCOUNT_BASE64, "base64").toString("utf8")
 );
@@ -16,7 +109,6 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// Backblaze B2 setup
 const b2 = new B2({
   applicationKeyId: process.env.B2_KEY_ID,
   applicationKey: process.env.B2_APPLICATION_KEY,
@@ -25,7 +117,6 @@ const b2 = new B2({
 let b2Authorized = false;
 let authorizationData = null;
 
-// Authorize B2 on startup
 async function authorizeB2() {
   try {
     const response = await b2.authorize();
@@ -38,37 +129,74 @@ async function authorizeB2() {
     return false;
   }
 }
-
-// Authorize on startup
 authorizeB2();
 
-// Default test route
-app.get("/", (req, res) => {
-  res.send("Chat Server is running on Railway 🚀");
-});
+// ============================================================================
+// 3. SHARED HELPER FUNCTIONS
+// ============================================================================
+
+// Shared logic so both /sendChatMessage AND Socket.io can use it
+async function sendFCM(senderId, receiverId, messageText) {
+  try {
+    const tokenDoc = await admin.firestore().collection("fcm_tokens").doc(receiverId).get();
+    
+    if (!tokenDoc.exists || !tokenDoc.data().token) {
+      console.log(`⚠️ No FCM token for ${receiverId}`);
+      return;
+    }
+
+    const payload = {
+      token: tokenDoc.data().token,
+      data: {
+        senderId: senderId,
+        message: messageText,
+        timestamp: Date.now().toString(),
+        type: "chat_message",
+      },
+      android: { priority: "high" },
+    };
+
+    await admin.messaging().send(payload);
+    console.log(`✅ Notification sent to ${receiverId}`);
+  } catch (error) {
+    console.error(`⚠️ FCM Failed: ${error.message}`);
+    if (error.code === 'messaging/invalid-registration-token' || 
+        error.code === 'messaging/registration-token-not-registered') {
+        await admin.firestore().collection("fcm_tokens").doc(receiverId).delete();
+    }
+  }
+}
 
 // ============================================================================
-// NEW: Get B2 Upload Authorization
+// 4. API ROUTES (LEGACY SUPPORT + NEW FEATURES) 🛣️
 // ============================================================================
+
+app.get("/", (req, res) => {
+  res.send("Chat Server Active (Hybrid Mode: Socket + REST) 🚀");
+});
+
+// NEW: History API (Replaces Firestore Pagination)
+app.get("/api/messages", async (req, res) => {
+  try {
+    const { roomId, beforeTimestamp, limit } = req.query;
+    const query = { roomId: roomId || "room1" };
+    if (beforeTimestamp) query.timestamp = { $lt: Number(beforeTimestamp) };
+    
+    const messages = await Message.find(query).sort({ timestamp: -1 }).limit(Number(limit) || 30);
+    res.json(messages);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// EXISTING: Get Upload Auth
 app.post("/getUploadAuth", async (req, res) => {
   try {
     const { userId, fileName, fileType } = req.body;
+    if (!userId || !fileName) return res.status(400).json({ success: false, error: "Missing data" });
 
-    if (!userId || !fileName) {
-      return res.status(400).json({
-        success: false,
-        error: "userId and fileName are required",
-      });
-    }
-
-    // Try to get upload URL
     try {
-      const uploadUrlResponse = await b2.getUploadUrl({
-        bucketId: process.env.B2_BUCKET_ID,
-      });
-
-      console.log(`✅ Upload URL generated for ${userId}`);
-
+      const uploadUrlResponse = await b2.getUploadUrl({ bucketId: process.env.B2_BUCKET_ID });
       return res.json({
         success: true,
         uploadUrl: uploadUrlResponse.data.uploadUrl,
@@ -76,304 +204,138 @@ app.post("/getUploadAuth", async (req, res) => {
         bucketName: process.env.B2_BUCKET_NAME,
       });
     } catch (uploadError) {
-      // If expired token, re-authorize and retry
       if (uploadError.status === 401 || uploadError.data?.code === 'expired_auth_token') {
-        console.log("⚠️ Token expired, re-authorizing...");
         await authorizeB2();
-        
-        // Retry after re-authorization
-        const uploadUrlResponse = await b2.getUploadUrl({
-          bucketId: process.env.B2_BUCKET_ID,
-        });
-
-        console.log(`✅ Upload URL generated after re-auth for ${userId}`);
-
+        const retry = await b2.getUploadUrl({ bucketId: process.env.B2_BUCKET_ID });
         return res.json({
           success: true,
-          uploadUrl: uploadUrlResponse.data.uploadUrl,
-          authorizationToken: uploadUrlResponse.data.authorizationToken,
+          uploadUrl: retry.data.uploadUrl,
+          authorizationToken: retry.data.authorizationToken,
           bucketName: process.env.B2_BUCKET_NAME,
         });
-      } else {
-        throw uploadError;
       }
+      throw uploadError;
     }
   } catch (error) {
-    console.error("❌ Error getting upload auth:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ============================================================================
-// Send chat message notification
-// ============================================================================
+// EXISTING: Send Chat Message (Preserved for Current App)
 app.post("/sendChatMessage", async (req, res) => {
   try {
     const { senderId, message } = req.body;
-    
-    console.log(`📨 Incoming message from ${senderId}: ${message}`);
     const receiverId = senderId === "user1" ? "user2" : "user1";
-    
-    // Try to get FCM token
-    const tokenDoc = await admin
-      .firestore()
-      .collection("fcm_tokens")
-      .doc(receiverId)
-      .get();
-      
-    if (!tokenDoc.exists) {
-      console.log(`⚠️ No FCM token found for ${receiverId} - message delivered via Firestore`);
-      // Return 200 success - message was still delivered via Firestore
-      return res.status(200).json({ 
-        success: true, 
-        message: "Message delivered, notification skipped (no token)" 
-      });
-    }
-    
-    const token = tokenDoc.data().token;
-    
-    if (!token) {
-      console.log(`⚠️ Empty FCM token for ${receiverId}`);
-      return res.status(200).json({ 
-        success: true, 
-        message: "Message delivered, notification skipped (empty token)" 
-      });
-    }
-    
-    console.log(`✅ Found token for ${receiverId}`);
-    
-    // Send notification
-    const payload = {
-      token,
-      data: {
-        senderId: senderId,
-        message: message,
-        timestamp: Date.now().toString(),
-        type: "chat_message",
-      },
-      android: {
-        priority: "high"
-      },
-    };
-    
-    try {
-      console.log(`📤 Sending notification to ${receiverId}...`);
-      const response = await admin.messaging().send(payload);
-      console.log(`✅ Notification sent successfully: ${response}`);
-      
-      return res.status(200).json({ 
-        success: true, 
-        messageId: response 
-      });
-      
-    } catch (fcmError) {
-      // FCM failed, but message was still delivered via Firestore
-      console.error(`⚠️ FCM send failed: ${fcmError.message}`);
-      
-      // Check if token is invalid and needs cleanup
-      if (fcmError.code === 'messaging/invalid-registration-token' || 
-          fcmError.code === 'messaging/registration-token-not-registered') {
-        console.log(`🗑️ Cleaning up invalid token for ${receiverId}`);
-        await admin.firestore().collection("fcm_tokens").doc(receiverId).delete();
-      }
-      
-      // Still return 200 - message was delivered
-      return res.status(200).json({ 
-        success: true, 
-        message: "Message delivered, notification failed",
-        fcmError: fcmError.message 
-      });
-    }
-    
+    await sendFCM(senderId, receiverId, message);
+    return res.status(200).json({ success: true, message: "Processed" });
   } catch (error) {
-    console.error("❌ Error in sendChatMessage:", error);
-    
-    // Return 200 even on error - message was delivered via Firestore
-    return res.status(200).json({ 
-      success: true, 
-      message: "Message delivered, notification processing failed",
-      error: error.message 
-    });
+    return res.status(200).json({ success: true, error: error.message });
   }
 });
 
+// EXISTING: Call Notification
 app.post("/sendCallNotification", async (req, res) => {
   try {
     const { callerId, calleeId, callType, callId } = req.body;
+    const tokenDoc = await admin.firestore().collection("fcm_tokens").doc(calleeId).get();
     
-    const tokenDoc = await admin.firestore()
-      .collection("fcm_tokens")
-      .doc(calleeId)
-      .get();
-    
-    if (!tokenDoc.exists) {
-      return res.json({ success: false, error: "No token" });
-    }
-    
-    const token = tokenDoc.data().token;
-    const callerName = callerId === "user1" ? "Shubham" : "Prachiti";
+    if (!tokenDoc.exists) return res.json({ success: false, error: "No token" });
     
     const payload = {
-      token,
+      token: tokenDoc.data().token,
       data: {
         type: "incoming_call",
-        callerId: callerId,
-        calleeId: calleeId,
-        callType: callType,
-        callId: callId,
-        callerName: callerName
+        callerId, calleeId, callType, callId,
+        callerName: callerId === "user1" ? "Shubham" : "Prachiti"
       },
-      android: {
-        priority: "high"
-      }
+      android: { priority: "high" }
     };
     
-    const response = await admin.messaging().send(payload);
-    return res.json({ success: true, messageId: response });
-    
+    await admin.messaging().send(payload);
+    res.json({ success: true });
   } catch (error) {
-    console.error("Error sending call notification:", error);
-    return res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
-// ============================================================================
-// Test notification endpoint
-// ============================================================================
+
+// EXISTING: Test Notification
 app.post("/testNotification", async (req, res) => {
   try {
     const { token, title, message } = req.body;
-
-    if (!token) {
-      return res.status(400).json({
-        success: false,
-        error: "Token is required",
-      });
-    }
+    if (!token) return res.status(400).json({ success: false, error: "Token required" });
 
     const payload = {
       token,
-      notification: {
-        title: title || "Test Notification",
-        body: message || "This is a test notification from your server",
-      },
-      data: {
-        test: "true",
-        timestamp: Date.now().toString(),
-      },
-      android: {
-        priority: "high",
-        notification: {
-          channelId: "chat_messages_high",
-        },
-      },
+      notification: { title: title || "Test", body: message || "Hello" },
+      android: { priority: "high" }
     };
 
     const response = await admin.messaging().send(payload);
-    console.log(`✅ Test notification sent`);
-
-    return res.json({ success: true, messageId: response });
+    res.json({ success: true, messageId: response });
   } catch (error) {
-    console.error("❌ Error sending test notification:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ============================================================================
-// Save FCM token endpoint
-// ============================================================================
+// EXISTING: Save Token (Hybrid Save)
 app.post("/saveFCMToken", async (req, res) => {
   try {
     const { userId, token } = req.body;
-
-    if (!userId || !token) {
-      return res.status(400).json({
-        success: false,
-        error: "userId and token are required",
-      });
+    // 1. Firebase (Legacy)
+    await admin.firestore().collection("fcm_tokens").doc(userId).set({ 
+      token, updatedAt: admin.firestore.FieldValue.serverTimestamp() 
+    });
+    
+    // 2. Mongo (Future)
+    if (mongoose.connection.readyState === 1) {
+        await User.findOneAndUpdate({ userId }, { fcmToken: token }, { upsert: true });
     }
 
-    await admin
-      .firestore()
-      .collection("fcm_tokens")
-      .doc(userId)
-      .set({
-        token: token,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-    console.log(`✅ Token saved for ${userId}`);
-    return res.json({ success: true });
+    res.json({ success: true });
   } catch (error) {
-    console.error("❌ Error saving token:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
-// NEW: Get signed download URL for B2 file
+
+// EXISTING: Get Signed URL
 app.post("/getSignedUrl", async (req, res) => {
   try {
     const { fileName } = req.body;
+    if (!fileName) return res.status(400).json({ success: false, error: "fileName required" });
 
-    if (!fileName) {
-      return res.status(400).json({
-        success: false,
-        error: "fileName is required",
-      });
-    }
+    if (!b2Authorized) await authorizeB2();
 
-    // Re-authorize if needed
-    if (!b2Authorized) {
-      await authorizeB2();
-    }
-
-    // Get download authorization
     const downloadAuth = await b2.getDownloadAuthorization({
       bucketId: process.env.B2_BUCKET_ID,
       fileNamePrefix: fileName,
-      validDurationInSeconds: 86400, // 24 hours
+      validDurationInSeconds: 86400,
     });
 
     const signedUrl = `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
-
-    console.log(`✅ Signed URL generated for ${fileName}`);
-
-    return res.json({
-      success: true,
-      signedUrl: signedUrl,
-    });
+    res.json({ success: true, signedUrl });
   } catch (error) {
-    console.error("❌ Error getting signed URL:", error);
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ============================================================================
-// Health check endpoint
-// ============================================================================
+// EXISTING: Health Check
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     b2Authorized: b2Authorized,
+    mongoConnected: mongoose.connection.readyState === 1
   });
 });
 
-// Railway uses PORT env variable
+// ============================================================================
+// 5. SERVER START (UPDATED FOR SOCKET.IO) 🚀
+// ============================================================================
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🔥 Server running on port ${PORT}`);
-  console.log(`🚀 Railway deployment active`);
-  console.log(`📱 Ready to send notifications!`);
+// CRITICAL: Listen on 'httpServer', NOT 'app'
+httpServer.listen(PORT, () => {
+  console.log(`🔥 Hybrid Server running on port ${PORT}`);
+  console.log(`🚀 Ready for Firebase (Current) AND Socket.io (Future)`);
 });
