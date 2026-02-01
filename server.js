@@ -2,9 +2,9 @@ import express from "express";
 import admin from "firebase-admin";
 import cors from "cors";
 import B2 from "backblaze-b2";
-import mongoose from "mongoose";       // NEW
-import { createServer } from "http";   // NEW
-import { Server } from "socket.io";    // NEW
+import mongoose from "mongoose";
+import { createServer } from "http";
+import { Server } from "socket.io";
 
 const app = express();
 app.use(cors());
@@ -15,14 +15,13 @@ app.use(express.json());
 // ============================================================================
 
 // Connect to MongoDB
-// On Render, this uses the Environment Variable. Locally, it defaults to localhost.
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/chat_app";
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
-// Define Schemas (Strict typing for your new data)
+// Define Schemas
 const MessageSchema = new mongoose.Schema({
   docId: { type: String, required: true, unique: true },
   text: String,
@@ -46,27 +45,52 @@ const UserSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', MessageSchema);
 const User = mongoose.model('User', UserSchema);
 
-// Setup Socket.io wrapped around Express
+// Setup Socket.io
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: { origin: "*" }
 });
 
-// Socket Logic (Runs parallel to your REST API)
+// ============================================================================
+// SOCKET.IO LOGIC (UPDATED WITH SYNC & DEBUGGING) ⚡
+// ============================================================================
 io.on('connection', (socket) => {
   console.log(`🔌 Socket Connected: ${socket.id}`);
 
-  // 1. Join Room
+  // 1. Join Room (FIXED: Handles "Blind Join")
   socket.on('join', async ({ userId, roomId }) => {
-    socket.join(roomId);
-    socket.userId = userId;
-    await User.findOneAndUpdate({ userId }, { isOnline: true, lastSeen: Date.now() }, { upsert: true });
-    socket.to(roomId).emit('presence_update', { userId, isOnline: true });
+    try {
+      socket.join(roomId);
+      socket.userId = userId;
+      console.log(`👤 User ${userId} joined room ${roomId}`); 
+
+      // A. Update DB & Broadcast "I am here"
+      await User.findOneAndUpdate({ userId }, { isOnline: true, lastSeen: Date.now() }, { upsert: true });
+      socket.to(roomId).emit('presence_update', { userId, isOnline: true });
+
+      // B. CHECK WHO IS ALREADY HERE (The Fix!)
+      // This fetches all other sockets in the room to see who is online
+      const sockets = await io.in(roomId).fetchSockets();
+      const onlineUsers = sockets
+          .map(s => s.userId)
+          .filter(id => id && id !== userId); // Exclude self and undefined
+
+      if (onlineUsers.length > 0) {
+          console.log(`📡 Telling ${userId} that these users are online:`, onlineUsers);
+          // Send a personal update to the user who just joined
+          onlineUsers.forEach(partnerId => {
+               socket.emit('presence_update', { userId: partnerId, isOnline: true });
+          });
+      }
+    } catch (e) {
+      console.error("Join Error:", e);
+    }
   });
 
-  // 2. Send Message (New Flow)
+  // 2. Send Message
   socket.on('send_message', async (data) => {
     try {
+      console.log(`📨 Socket Message from ${data.senderId}`);
       // Save to Mongo
       const newMsg = new Message(data);
       await newMsg.save();
@@ -75,7 +99,7 @@ io.on('connection', (socket) => {
       io.to(data.roomId).emit('new_message', data);
       socket.emit('message_sent', { docId: data.docId, status: 'sent' });
 
-      // Trigger Notification (Reuse existing logic!)
+      // Trigger Notification
       const receiverId = data.senderId === "user1" ? "user2" : "user1";
       await sendFCM(data.senderId, receiverId, data.text || "New Message");
 
@@ -86,10 +110,13 @@ io.on('connection', (socket) => {
 
   // 3. Typing (Volatile)
   socket.on('typing', ({ roomId, isTyping }) => {
+    // console.log(`⌨️ ${socket.userId} typing: ${isTyping}`);
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
   });
 
+  // 4. Disconnect
   socket.on('disconnect', async () => {
+    console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
     if (socket.userId) {
       await User.findOneAndUpdate({ userId: socket.userId }, { isOnline: false, lastSeen: Date.now() });
       io.emit('presence_update', { userId: socket.userId, isOnline: false });
