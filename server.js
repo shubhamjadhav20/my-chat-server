@@ -114,15 +114,30 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
   });
 
-  // 4. Disconnect
+
+// 4. Smart Disconnect
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
+    
     if (socket.userId) {
+      // CRITICAL FIX: Check if user has other active sockets
+      // We look for other sockets in the user's "room" (which is just their userId if we used join, 
+      // but here we used room1. Let's filter by userId property on the socket object)
+      
+      const sockets = await io.fetchSockets();
+      const remainingConnections = sockets.filter(s => s.userId === socket.userId);
+
+      if (remainingConnections.length > 0) {
+        console.log(`⚠️ User ${socket.userId} still has ${remainingConnections.length} active connection(s). keeping ONLINE.`);
+        return; // Don't mark offline!
+      }
+
+      // If no connections left, THEN mark offline
       await User.findOneAndUpdate({ userId: socket.userId }, { isOnline: false, lastSeen: Date.now() });
       io.emit('presence_update', { userId: socket.userId, isOnline: false });
+      console.log(`🔴 User ${socket.userId} is now truly OFFLINE.`);
     }
   });
-});
 
 // ============================================================================
 // 2. EXISTING CONFIGURATION (FIREBASE & B2) - UNCHANGED 🛡️
