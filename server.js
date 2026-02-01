@@ -69,7 +69,6 @@ io.on('connection', (socket) => {
       socket.to(roomId).emit('presence_update', { userId, isOnline: true });
 
       // B. CHECK WHO IS ALREADY HERE (The Fix!)
-      // This fetches all other sockets in the room to see who is online
       const sockets = await io.in(roomId).fetchSockets();
       const onlineUsers = sockets
           .map(s => s.userId)
@@ -77,7 +76,6 @@ io.on('connection', (socket) => {
 
       if (onlineUsers.length > 0) {
           console.log(`📡 Telling ${userId} that these users are online:`, onlineUsers);
-          // Send a personal update to the user who just joined
           onlineUsers.forEach(partnerId => {
                socket.emit('presence_update', { userId: partnerId, isOnline: true });
           });
@@ -91,15 +89,12 @@ io.on('connection', (socket) => {
   socket.on('send_message', async (data) => {
     try {
       console.log(`📨 Socket Message from ${data.senderId}`);
-      // Save to Mongo
       const newMsg = new Message(data);
       await newMsg.save();
 
-      // Emit to room
       io.to(data.roomId).emit('new_message', data);
       socket.emit('message_sent', { docId: data.docId, status: 'sent' });
 
-      // Trigger Notification
       const receiverId = data.senderId === "user1" ? "user2" : "user1";
       await sendFCM(data.senderId, receiverId, data.text || "New Message");
 
@@ -110,25 +105,20 @@ io.on('connection', (socket) => {
 
   // 3. Typing (Volatile)
   socket.on('typing', ({ roomId, isTyping }) => {
-    // console.log(`⌨️ ${socket.userId} typing: ${isTyping}`);
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
   });
 
-
-// 4. Smart Disconnect
+  // 4. Smart Disconnect
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
     
     if (socket.userId) {
-      // CRITICAL FIX: Check if user has other active sockets
-      // We look for other sockets in the user's "room" (which is just their userId if we used join, 
-      // but here we used room1. Let's filter by userId property on the socket object)
-      
+      // Check if user has other active sockets
       const sockets = await io.fetchSockets();
       const remainingConnections = sockets.filter(s => s.userId === socket.userId);
 
       if (remainingConnections.length > 0) {
-        console.log(`⚠️ User ${socket.userId} still has ${remainingConnections.length} active connection(s). keeping ONLINE.`);
+        console.log(`⚠️ User ${socket.userId} still has ${remainingConnections.length} active connection(s). Keeping ONLINE.`);
         return; // Don't mark offline!
       }
 
@@ -138,6 +128,8 @@ io.on('connection', (socket) => {
       console.log(`🔴 User ${socket.userId} is now truly OFFLINE.`);
     }
   });
+
+}); // <--- THIS WAS MISSING! This closes io.on('connection', ...)
 
 // ============================================================================
 // 2. EXISTING CONFIGURATION (FIREBASE & B2) - UNCHANGED 🛡️
@@ -177,7 +169,6 @@ authorizeB2();
 // 3. SHARED HELPER FUNCTIONS
 // ============================================================================
 
-// Shared logic so both /sendChatMessage AND Socket.io can use it
 async function sendFCM(senderId, receiverId, messageText) {
   try {
     const tokenDoc = await admin.firestore().collection("fcm_tokens").doc(receiverId).get();
@@ -217,7 +208,6 @@ app.get("/", (req, res) => {
   res.send("Chat Server Active (Hybrid Mode: Socket + REST) 🚀");
 });
 
-// NEW: History API (Replaces Firestore Pagination)
 app.get("/api/messages", async (req, res) => {
   try {
     const { roomId, beforeTimestamp, limit } = req.query;
@@ -231,7 +221,6 @@ app.get("/api/messages", async (req, res) => {
   }
 });
 
-// EXISTING: Get Upload Auth
 app.post("/getUploadAuth", async (req, res) => {
   try {
     const { userId, fileName, fileType } = req.body;
@@ -263,7 +252,6 @@ app.post("/getUploadAuth", async (req, res) => {
   }
 });
 
-// EXISTING: Send Chat Message (Preserved for Current App)
 app.post("/sendChatMessage", async (req, res) => {
   try {
     const { senderId, message } = req.body;
@@ -275,7 +263,6 @@ app.post("/sendChatMessage", async (req, res) => {
   }
 });
 
-// EXISTING: Call Notification
 app.post("/sendCallNotification", async (req, res) => {
   try {
     const { callerId, calleeId, callType, callId } = req.body;
@@ -300,7 +287,6 @@ app.post("/sendCallNotification", async (req, res) => {
   }
 });
 
-// EXISTING: Test Notification
 app.post("/testNotification", async (req, res) => {
   try {
     const { token, title, message } = req.body;
@@ -319,7 +305,6 @@ app.post("/testNotification", async (req, res) => {
   }
 });
 
-// EXISTING: Save Token (Hybrid Save)
 app.post("/saveFCMToken", async (req, res) => {
   try {
     const { userId, token } = req.body;
@@ -339,7 +324,6 @@ app.post("/saveFCMToken", async (req, res) => {
   }
 });
 
-// EXISTING: Get Signed URL
 app.post("/getSignedUrl", async (req, res) => {
   try {
     const { fileName } = req.body;
@@ -360,7 +344,6 @@ app.post("/getSignedUrl", async (req, res) => {
   }
 });
 
-// EXISTING: Health Check
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -376,7 +359,6 @@ app.get("/health", (req, res) => {
 // ============================================================================
 
 const PORT = process.env.PORT || 3000;
-// CRITICAL: Listen on 'httpServer', NOT 'app'
 httpServer.listen(PORT, () => {
   console.log(`🔥 Hybrid Server running on port ${PORT}`);
   console.log(`🚀 Ready for Firebase (Current) AND Socket.io (Future)`);
