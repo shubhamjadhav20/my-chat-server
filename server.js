@@ -11,17 +11,15 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================================
-// 1. HYBRID SETUP: DATABASE & SOCKETS (THE NEW BRAIN) 🧠
+// 1. SETUP & CONNECTIONS
 // ============================================================================
 
-// Connect to MongoDB
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/chat_app";
-
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
-// Define Schemas
+// Schemas
 const MessageSchema = new mongoose.Schema({
   docId: { type: String, required: true, unique: true },
   text: String,
@@ -45,14 +43,12 @@ const UserSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', MessageSchema);
 const User = mongoose.model('User', UserSchema);
 
-// Setup Socket.io
+// Socket Setup
 const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: { origin: "*" }
-});
+const io = new Server(httpServer, { cors: { origin: "*" } });
 
 // ============================================================================
-// SOCKET.IO LOGIC (UPDATED WITH SYNC & DEBUGGING) ⚡
+// 2. SOCKET LOGIC (THE BRIDGE 🌉)
 // ============================================================================
 io.on('connection', (socket) => {
   console.log(`🔌 Socket Connected: ${socket.id}`);
@@ -61,44 +57,55 @@ io.on('connection', (socket) => {
   socket.on('join', async ({ userId, roomId }) => {
     try {
       socket.join(roomId);
-      
-      // FIX: Persist userId in socket.data for fetchSockets() visibility
-      socket.data.userId = userId;
-      socket.userId = userId; // Keep for local scope convenience
+      socket.data.userId = userId; // Critical for Smart Disconnect
+      socket.userId = userId;
 
-      console.log(`👤 User ${userId} joined room ${roomId}`); 
-
-      // A. Update DB & Broadcast "I am here"
       await User.findOneAndUpdate({ userId }, { isOnline: true, lastSeen: Date.now() }, { upsert: true });
       socket.to(roomId).emit('presence_update', { userId, isOnline: true });
 
-      // B. CHECK WHO IS ALREADY HERE
+      // Check who else is here
       const sockets = await io.in(roomId).fetchSockets();
-      const onlineUsers = sockets
-          .map(s => s.data.userId) // FIX: Read from s.data.userId
-          .filter(id => id && id !== userId); // Exclude self and undefined
+      const onlineUsers = sockets.map(s => s.data.userId).filter(id => id && id !== userId);
 
       if (onlineUsers.length > 0) {
-          console.log(`📡 Telling ${userId} that these users are online:`, onlineUsers);
           onlineUsers.forEach(partnerId => {
                socket.emit('presence_update', { userId: partnerId, isOnline: true });
           });
       }
-    } catch (e) {
-      console.error("Join Error:", e);
-    }
+    } catch (e) { console.error("Join Error:", e); }
   });
 
-  // 2. Send Message
+  // --- 📨 SEND MESSAGE (BRIDGE ENABLED) ---
   socket.on('send_message', async (data) => {
     try {
       console.log(`📨 Socket Message from ${data.senderId}`);
+
+      // 1. Save to MongoDB (The New Way)
       const newMsg = new Message(data);
       await newMsg.save();
 
+      // 2. Emit to Socket Users (You)
       io.to(data.roomId).emit('new_message', data);
       socket.emit('message_sent', { docId: data.docId, status: 'sent' });
 
+      // 3. 🌉 THE BRIDGE: Write to Firestore (For Her)
+      // This ensures her old app sees the message in the database listener
+      try {
+        await admin.firestore()
+          .collection('rooms')
+          .doc(data.roomId || 'room1')
+          .collection('messages')
+          .doc(data.docId) // Use same ID to prevent duplicates later
+          .set({
+             ...data,
+             timestamp: admin.firestore.FieldValue.serverTimestamp() // Use Server Time for sorting
+          });
+        console.log("🌉 Bridged message to Firestore for compatibility");
+      } catch (fsError) {
+        console.error("❌ Firestore Bridge Failed:", fsError);
+      }
+
+      // 4. Send Notification
       const receiverId = data.senderId === "user1" ? "user2" : "user1";
       await sendFCM(data.senderId, receiverId, data.text || "New Message");
 
@@ -112,32 +119,21 @@ io.on('connection', (socket) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
   });
 
-  // 4. Smart Disconnect
+  // 4. Disconnect
   socket.on('disconnect', async () => {
-    console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
-    
-    if (socket.userId) { // Uses local scope variable
-      // Check if user has other active sockets
+    if (socket.userId) {
       const sockets = await io.fetchSockets();
-      // FIX: Filter using s.data.userId
       const remainingConnections = sockets.filter(s => s.data.userId === socket.userId);
+      if (remainingConnections.length > 0) return;
 
-      if (remainingConnections.length > 0) {
-        console.log(`⚠️ User ${socket.userId} still has ${remainingConnections.length} active connection(s). Keeping ONLINE.`);
-        return; // Don't mark offline!
-      }
-
-      // If no connections left, THEN mark offline
       await User.findOneAndUpdate({ userId: socket.userId }, { isOnline: false, lastSeen: Date.now() });
       io.emit('presence_update', { userId: socket.userId, isOnline: false });
-      console.log(`🔴 User ${socket.userId} is now truly OFFLINE.`);
     }
   });
-
-}); // End of io.on('connection')
+});
 
 // ============================================================================
-// 2. EXISTING CONFIGURATION (FIREBASE & B2) - UNCHANGED 🛡️
+// 3. CONFIGURATION (FIREBASE & B2)
 // ============================================================================
 
 const serviceAccount = JSON.parse(
@@ -155,7 +151,6 @@ const b2 = new B2({
 
 let b2Authorized = false;
 let authorizationData = null;
-
 async function authorizeB2() {
   try {
     const response = await b2.authorize();
@@ -171,7 +166,7 @@ async function authorizeB2() {
 authorizeB2();
 
 // ============================================================================
-// 3. SHARED HELPER FUNCTIONS
+// 4. HELPER FUNCTIONS
 // ============================================================================
 
 async function sendFCM(senderId, receiverId, messageText) {
@@ -206,11 +201,11 @@ async function sendFCM(senderId, receiverId, messageText) {
 }
 
 // ============================================================================
-// 4. API ROUTES (LEGACY SUPPORT + NEW FEATURES) 🛣️
+// 5. API ROUTES (ALL ROUTES INCLUDED)
 // ============================================================================
 
 app.get("/", (req, res) => {
-  res.send("Chat Server Active (Hybrid Mode: Socket + REST) 🚀");
+  res.send("Chat Server Active (Hybrid Bridge Mode) 🌉");
 });
 
 app.get("/api/messages", async (req, res) => {
@@ -360,11 +355,11 @@ app.get("/health", (req, res) => {
 });
 
 // ============================================================================
-// 5. SERVER START (UPDATED FOR SOCKET.IO) 🚀
+// 6. SERVER START
 // ============================================================================
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  console.log(`🔥 Hybrid Server running on port ${PORT}`);
+  console.log(`🔥 Hybrid Bridge Server running on port ${PORT}`);
   console.log(`🚀 Ready for Firebase (Current) AND Socket.io (Future)`);
 });
