@@ -57,21 +57,25 @@ const io = new Server(httpServer, {
 io.on('connection', (socket) => {
   console.log(`🔌 Socket Connected: ${socket.id}`);
 
-  // 1. Join Room (FIXED: Handles "Blind Join")
+  // 1. Join Room
   socket.on('join', async ({ userId, roomId }) => {
     try {
       socket.join(roomId);
-      socket.userId = userId;
+      
+      // FIX: Persist userId in socket.data for fetchSockets() visibility
+      socket.data.userId = userId;
+      socket.userId = userId; // Keep for local scope convenience
+
       console.log(`👤 User ${userId} joined room ${roomId}`); 
 
       // A. Update DB & Broadcast "I am here"
       await User.findOneAndUpdate({ userId }, { isOnline: true, lastSeen: Date.now() }, { upsert: true });
       socket.to(roomId).emit('presence_update', { userId, isOnline: true });
 
-      // B. CHECK WHO IS ALREADY HERE (The Fix!)
+      // B. CHECK WHO IS ALREADY HERE
       const sockets = await io.in(roomId).fetchSockets();
       const onlineUsers = sockets
-          .map(s => s.userId)
+          .map(s => s.data.userId) // FIX: Read from s.data.userId
           .filter(id => id && id !== userId); // Exclude self and undefined
 
       if (onlineUsers.length > 0) {
@@ -103,7 +107,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 3. Typing (Volatile)
+  // 3. Typing
   socket.on('typing', ({ roomId, isTyping }) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
   });
@@ -112,10 +116,11 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
     
-    if (socket.userId) {
+    if (socket.userId) { // Uses local scope variable
       // Check if user has other active sockets
       const sockets = await io.fetchSockets();
-      const remainingConnections = sockets.filter(s => s.userId === socket.userId);
+      // FIX: Filter using s.data.userId
+      const remainingConnections = sockets.filter(s => s.data.userId === socket.userId);
 
       if (remainingConnections.length > 0) {
         console.log(`⚠️ User ${socket.userId} still has ${remainingConnections.length} active connection(s). Keeping ONLINE.`);
@@ -129,7 +134,7 @@ io.on('connection', (socket) => {
     }
   });
 
-}); // <--- THIS WAS MISSING! This closes io.on('connection', ...)
+}); // End of io.on('connection')
 
 // ============================================================================
 // 2. EXISTING CONFIGURATION (FIREBASE & B2) - UNCHANGED 🛡️
