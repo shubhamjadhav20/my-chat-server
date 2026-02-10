@@ -52,7 +52,7 @@ const io = new Server(httpServer, {
 });
 
 // ============================================================================
-// SOCKET.IO LOGIC (UPDATED WITH SYNC & DEBUGGING) ⚡
+// SOCKET.IO LOGIC (WITH BRIDGE 🌉 & TICKS ✅)
 // ============================================================================
 io.on('connection', (socket) => {
   console.log(`🔌 Socket Connected: ${socket.id}`);
@@ -89,30 +89,64 @@ io.on('connection', (socket) => {
     }
   });
 
-  // 2. Send Message
+  // 2. Send Message (WITH BRIDGE 🌉)
   socket.on('send_message', async (data) => {
     try {
       console.log(`📨 Socket Message from ${data.senderId}`);
+
+      // A. Save to MongoDB (The New Brain)
       const newMsg = new Message(data);
       await newMsg.save();
 
+      // B. Emit to You (Socket)
       io.to(data.roomId).emit('new_message', data);
       socket.emit('message_sent', { docId: data.docId, status: 'sent' });
 
+      // C. THE BRIDGE: Write to Firestore (For Her) 🌉
+      // This is what you were missing!
+      try {
+        await admin.firestore()
+          .collection('rooms')
+          .doc(data.roomId || 'room1')
+          .collection('messages')
+          .doc(data.docId)
+          .set({
+             ...data,
+             timestamp: admin.firestore.FieldValue.serverTimestamp()
+          });
+        console.log("✅ Bridged to Firestore");
+      } catch (e) { console.error("Bridge Error:", e.message); }
+
+      // D. Send Notification
       const receiverId = data.senderId === "user1" ? "user2" : "user1";
       await sendFCM(data.senderId, receiverId, data.text || "New Message");
 
-    } catch (e) {
-      console.error("Socket Save Error:", e);
-    }
+    } catch (e) { console.error("Socket Save Error:", e); }
   });
 
-  // 3. Typing
+  // 3. Status Updates (Ticks ✅)
+  socket.on('update_status', async ({ docId, status, roomId }) => {
+      console.log(`🔄 Status Update: ${docId} -> ${status}`);
+      
+      // A. Update MongoDB
+      await Message.findOneAndUpdate({ docId }, { status, seen: status === 'seen' });
+
+      // B. Tell everyone via Socket (Instant UI update)
+      io.to(roomId).emit('status_updated', { docId, status });
+
+      // C. Update Firestore (For persistent Blue Ticks on old app)
+      try {
+          await admin.firestore().collection('rooms').doc(roomId)
+            .collection('messages').doc(docId).update({ status, seen: status === 'seen' });
+      } catch(e) {}
+  });
+
+  // 4. Typing
   socket.on('typing', ({ roomId, isTyping }) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
   });
 
-  // 4. Smart Disconnect
+  // 5. Smart Disconnect
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
     
@@ -133,26 +167,8 @@ io.on('connection', (socket) => {
       console.log(`🔴 User ${socket.userId} is now truly OFFLINE.`);
     }
   });
-  socket.on('update_status', async ({ docId, status, roomId }) => {
-      console.log(`🔄 Status Update: ${docId} -> ${status}`);
-      
-      // 1. Update MongoDB (The New Brain)
-      await Message.findOneAndUpdate({ docId }, { status, seen: status === 'seen' });
 
-      // 2. Tell everyone in the room (So sender's phone updates instantly)
-      io.to(roomId).emit('status_updated', { docId, status });
-
-      // 3. Update Firestore (So the ticks stick permanently)
-      try {
-          await admin.firestore().collection('rooms').doc(roomId)
-            .collection('messages').doc(docId).update({ status, seen: status === 'seen' });
-      } catch(e) {
-          // Ignore errors if doc doesn't exist in Firestore
-      }
-  });
-
-}); // End of io.on('connection')
-
+});
 // ============================================================================
 // 2. EXISTING CONFIGURATION (FIREBASE & B2) - UNCHANGED 🛡️
 // ============================================================================
