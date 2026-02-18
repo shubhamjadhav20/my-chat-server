@@ -154,7 +154,7 @@ io.on('connection', (socket) => {
       // Check if user has other active sockets
       const sockets = await io.fetchSockets();
       // FIX: Filter using s.data.userId
-      const remainingConnections = sockets.filter(s => s.data.userId === socket.userId);
+      const remainingConnections = sockets.filter(s => s.data.userId === socket.userId && s.id !== socket.id);
 
       if (remainingConnections.length > 0) {
         console.log(`⚠️ User ${socket.userId} still has ${remainingConnections.length} active connection(s). Keeping ONLINE.`);
