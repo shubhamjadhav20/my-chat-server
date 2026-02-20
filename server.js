@@ -100,7 +100,7 @@ io.on('connection', (socket) => {
 
       // B. Emit to You (Socket)
       io.to(data.roomId).emit('new_message', data);
-      socket.emit('message_sent', { docId: data.docId, status: 'sent' });
+     socket.emit('message_sent', { docId: data.docId, localId: data.localId, status: 'sent' });
 
       // C. THE BRIDGE: Write to Firestore (For Her) 🌉
       // This is what you were missing!
