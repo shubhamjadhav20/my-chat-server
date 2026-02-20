@@ -237,7 +237,23 @@ async function sendFCM(senderId, receiverId, messageText) {
     }
   }
 }
-
+app.get("/api/messages/search", async (req, res) => {
+    try {
+        const { roomId, q } = req.query;
+        if (!q || q.length < 2) return res.json([]);
+        
+        const results = await Message.find({
+            roomId: roomId || "room1",
+            text: { $regex: q, $options: "i" }
+        })
+        .sort({ timestamp: -1 })
+        .limit(50);
+        
+        res.json(results);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
 // ============================================================================
 // 4. API ROUTES (LEGACY SUPPORT + NEW FEATURES) 🛣️
 // ============================================================================
