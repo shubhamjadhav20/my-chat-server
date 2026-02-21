@@ -95,8 +95,9 @@ io.on('connection', (socket) => {
       console.log(`📨 Socket Message from ${data.senderId}`);
 
       // A. Save to MongoDB (The New Brain)
-      const newMsg = new Message(data);
-      await newMsg.save();
+const newMsg = new Message(data);
+await newMsg.save();
+await Message.findOneAndUpdate({ docId: data.docId }, { status: 'delivered' });
 
       // B. Emit to You (Socket)
       io.to(data.roomId).emit('new_message', data);
@@ -110,10 +111,11 @@ io.on('connection', (socket) => {
           .doc(data.roomId || 'room1')
           .collection('messages')
           .doc(data.docId)
-          .set({
-             ...data,
-             timestamp: admin.firestore.FieldValue.serverTimestamp()
-          });
+        .set({
+   ...data,
+   status: 'delivered',
+   timestamp: admin.firestore.FieldValue.serverTimestamp()
+});
         console.log("✅ Bridged to Firestore");
       } catch (e) { console.error("Bridge Error:", e.message); }
 
