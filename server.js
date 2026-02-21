@@ -32,6 +32,14 @@ const MessageSchema = new mongoose.Schema({
   mediaUrl: String,
   mediaType: String,
   replyToMessageId: String,
+  replyToText: String,
+  replyToSender: String,
+  replyToMediaUrl: String,
+  replyToMediaType: String,
+  edited: { type: Boolean, default: false },
+  editedAt: Number,
+  originalText: String,
+  localId: String,
   roomId: { type: String, default: "room1" }
 });
 
@@ -253,6 +261,54 @@ app.get("/api/messages/search", async (req, res) => {
         
         res.json(results);
     } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+// Edit message
+app.post("/api/messages/edit", async (req, res) => {
+    try {
+        const { docId, newText, roomId } = req.body;
+        if (!docId || !newText) return res.status(400).json({ error: "Missing docId or newText" });
+
+        const msg = await Message.findOne({ docId });
+        if (!msg) return res.status(404).json({ error: "Message not found" });
+
+        await Message.findOneAndUpdate({ docId }, {
+            text: newText,
+            edited: true,
+            editedAt: Date.now(),
+            originalText: msg.text
+        });
+
+        // Update Firestore too
+        try {
+            await admin.firestore()
+                .collection('rooms').doc(roomId || 'room1')
+                .collection('messages').doc(docId)
+                .update({
+                    text: newText,
+                    edited: true,
+                    editedAt: Date.now(),
+                    originalText: msg.text
+                });
+        } catch(e) {}
+
+        // Notify via socket
+        io.to(roomId || 'room1').emit('message_edited', { docId, newText, editedAt: Date.now() });
+
+        res.json({ success: true });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Clear all messages
+app.delete("/api/messages/clear", async (req, res) => {
+    try {
+        const { roomId } = req.body;
+        await Message.deleteMany({ roomId: roomId || 'room1' });
+        res.json({ success: true });
+    } catch(e) {
         res.status(500).json({ error: e.message });
     }
 });
