@@ -31,6 +31,7 @@ const MessageSchema = new mongoose.Schema({
   status: { type: String, default: "sent" },
   mediaUrl: String,
   mediaType: String,
+  viewOnce: { type: Boolean, default: false },  // ← ADD THIS
   replyToMessageId: String,
   replyToText: String,
   replyToSender: String,
@@ -247,6 +248,20 @@ async function sendFCM(senderId, receiverId, messageText) {
     }
   }
 }
+app.get("/api/media", async (req, res) => {
+  try {
+    const { roomId } = req.query;
+    const mediaMessages = await Message.find({
+      roomId: roomId || "room1",
+      mediaUrl: { $exists: true, $ne: null, $ne: "" }
+    })
+      .sort({ timestamp: -1 })
+      .select("docId senderId timestamp seen status mediaUrl mediaType viewOnce replyToMessageId replyToText replyToSender text");
+    res.json(mediaMessages);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get("/api/messages/search", async (req, res) => {
     try {
         const { roomId, q } = req.query;
