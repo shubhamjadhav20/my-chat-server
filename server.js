@@ -53,7 +53,12 @@ const MessageSchema = new mongoose.Schema({
   editedAt: Number,
   originalText: String,
   localId: String,
-  roomId: { type: String, default: "room1" }
+  roomId: { type: String, default: "room1" },
+  reactions: [{
+    emoji: String,
+    userId: String,
+    timestamp: Number
+  }]
 });
 
 const UserSchema = new mongoose.Schema({
@@ -125,6 +130,35 @@ io.on('connection', (socket) => {
 
   socket.on('typing', ({ roomId, isTyping }) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
+  });
+
+  // Reactions — stored in MongoDB on the message document, broadcast via socket.
+  // No Firestore involved — zero reads/writes for reactions.
+  socket.on('add_reaction', async ({ docId, emoji, userId, roomId }) => {
+    try {
+      // Pull current reactions, add the new one (avoid duplicates)
+      const msg = await Message.findOne({ docId });
+      if (!msg) return;
+      const reactions = msg.reactions || [];
+      const alreadyExists = reactions.some(r => r.emoji === emoji && r.userId === userId);
+      if (!alreadyExists) {
+        reactions.push({ emoji, userId, timestamp: Date.now() });
+        await Message.findOneAndUpdate({ docId }, { reactions });
+      }
+      // Broadcast full reactions array so clients can rebuild their map
+      io.to(roomId).emit('reaction_update', { docId, reactions });
+    } catch (e) { console.error('add_reaction error:', e.message); }
+  });
+
+  socket.on('remove_reaction', async ({ docId, emoji, userId, roomId }) => {
+    try {
+      const msg = await Message.findOne({ docId });
+      if (!msg) return;
+      const reactions = (msg.reactions || [])
+        .filter(r => !(r.emoji === emoji && r.userId === userId));
+      await Message.findOneAndUpdate({ docId }, { reactions });
+      io.to(roomId).emit('reaction_update', { docId, reactions });
+    } catch (e) { console.error('remove_reaction error:', e.message); }
   });
 
   socket.on('disconnect', async () => {
@@ -295,7 +329,7 @@ app.get("/api/media", async (req, res) => {
       mediaUrl: { $exists: true, $ne: null, $ne: "" }
     })
       .sort({ timestamp: -1 })
-      .select("docId senderId timestamp seen status mediaUrl mediaType viewOnce replyToMessageId replyToText replyToSender text");
+      .select("docId senderId timestamp seen status mediaUrl mediaType viewOnce replyToMessageId replyToText replyToSender text reactions");
     res.json(mediaMessages);
   } catch (e) {
     res.status(500).json({ error: e.message });
