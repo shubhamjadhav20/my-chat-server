@@ -412,7 +412,17 @@ app.delete("/api/messages/clear", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
+app.get("/api/messages/find", async (req, res) => {
+  try {
+    const { docId, roomId } = req.query;
+    if (!docId) return res.status(400).json({ error: "docId required" });
+    const msg = await Message.findOne({ docId, roomId: roomId || "room1" });
+    if (!msg) return res.status(404).json({ error: "Not found" });
+    res.json(msg);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.post("/getUploadAuth", async (req, res) => {
   try {
     const { userId, fileName, fileType } = req.body;
