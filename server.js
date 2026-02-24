@@ -79,7 +79,13 @@ const io = new Server(httpServer, { cors: { origin: "*" } });
 // ============================================================================
 io.on('connection', (socket) => {
   console.log(`🔌 Socket Connected: ${socket.id}`);
-
+socket.on('recording', ({ roomId, isRecording }) => {
+  // Broadcast to the OTHER person in the room only
+  socket.to(roomId).emit('partner_recording', {
+    userId: socket.userId || socket.data?.userId,
+    isRecording
+  });
+});
   socket.on('join', async ({ userId, roomId }) => {
     try {
       socket.join(roomId);
@@ -381,6 +387,42 @@ app.post("/api/batch-signed-urls", async (req, res) => {
     res.json(response);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+app.post("/api/messages/delete-batch", async (req, res) => {
+  try {
+    const { docIds, roomId } = req.body;
+    if (!Array.isArray(docIds) || docIds.length === 0) {
+      return res.status(400).json({ error: "docIds array required" });
+    }
+
+    const room = roomId || "room1";
+
+    // 1. Delete from MongoDB
+    const result = await Message.deleteMany({ docId: { $in: docIds }, roomId: room });
+
+    // 2. Delete from Firestore (best effort — don't fail if this errors)
+    try {
+      const firestoreBatch = admin.firestore().batch();
+      docIds.forEach(docId => {
+        const ref = admin.firestore()
+          .collection('rooms').doc(room)
+          .collection('messages').doc(docId);
+        firestoreBatch.delete(ref);
+      });
+      await firestoreBatch.commit();
+    } catch (fsErr) {
+      console.error("Firestore batch delete failed (non-fatal):", fsErr.message);
+    }
+
+    // 3. Broadcast to both devices so the other person's UI updates instantly
+    io.to(room).emit('messages_deleted', { docIds });
+
+    console.log(`🗑️ Deleted ${result.deletedCount} messages from room ${room}`);
+    res.json({ success: true, deleted: result.deletedCount });
+  } catch (e) {
+    console.error("delete-batch error:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
