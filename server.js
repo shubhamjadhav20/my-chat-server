@@ -511,12 +511,18 @@ app.post("/sendCallNotification", async (req, res) => {
     const { callerId, calleeId, callType, callId } = req.body;
     const tokenDoc = await admin.firestore().collection("fcm_tokens").doc(calleeId).get();
     if (!tokenDoc.exists) return res.json({ success: false, error: "No token" });
+    
+    const callerName = callerId === "user1" ? "Shubham" : "Prachiti";
     const payload = {
       token: tokenDoc.data().token,
-      data: { type: "incoming_call", callerId, calleeId, callType, callId,
-              callerName: callerId === "user1" ? "Shubham" : "Prachiti" },
+      notification: {
+        title: `Incoming ${callType === "VIDEO" ? "Video" : "Voice"} Call`,
+        body: `${callerName} is calling you...`
+      },
+      data: { type: "incoming_call", callerId, calleeId, callType, callId, callerName },
       android: { priority: "high" }
     };
+    
     await admin.messaging().send(payload);
     res.json({ success: true });
   } catch (error) {
