@@ -166,7 +166,46 @@ socket.on('recording', ({ roomId, isRecording }) => {
       io.to(roomId).emit('reaction_update', { docId, reactions });
     } catch (e) { console.error('remove_reaction error:', e.message); }
   });
+// WebRTC Signaling via Socket — zero Firestore reads
+socket.on('call_initiate', async ({ callId, callerId, calleeId, callType, roomId }) => {
+    try {
+        socket.to(roomId).emit('incoming_call', { callId, callerId, calleeId, callType });
+        // Send FCM push for background notification
+        const tokenDoc = await admin.firestore().collection("fcm_tokens").doc(calleeId).get();
+        if (tokenDoc.exists && tokenDoc.data().token) {
+            await admin.messaging().send({
+                token: tokenDoc.data().token,
+                data: { type: "incoming_call", callerId, calleeId, callType, callId,
+                        callerName: callerId === "user1" ? "Shubham" : "Prachiti" },
+                android: { priority: "high" }
+            });
+        }
+    } catch (e) { console.error('call_initiate error:', e.message); }
+});
 
+socket.on('call_answer', ({ callId, roomId }) => {
+    socket.to(roomId).emit('call_answered', { callId });
+});
+
+socket.on('call_decline', ({ callId, roomId }) => {
+    socket.to(roomId).emit('call_declined', { callId });
+});
+
+socket.on('call_end', ({ callId, roomId }) => {
+    socket.to(roomId).emit('call_ended', { callId });
+});
+
+socket.on('call_offer', ({ callId, sdp, roomId }) => {
+    socket.to(roomId).emit('call_offer', { callId, sdp });
+});
+
+socket.on('call_answer_sdp', ({ callId, sdp, roomId }) => {
+    socket.to(roomId).emit('call_answer_sdp', { callId, sdp });
+});
+
+socket.on('ice_candidate', ({ callId, candidate, sdpMid, sdpMLineIndex, roomId }) => {
+    socket.to(roomId).emit('ice_candidate', { callId, candidate, sdpMid, sdpMLineIndex });
+});
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.id} (${socket.userId})`);
     if (socket.userId) {
