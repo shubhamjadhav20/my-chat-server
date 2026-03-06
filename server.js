@@ -94,13 +94,21 @@ socket.on('recording', ({ roomId, isRecording }) => {
       console.log(`👤 User ${userId} joined room ${roomId}`);
       await User.findOneAndUpdate({ userId }, { isOnline: true, lastSeen: Date.now() }, { upsert: true });
       socket.to(roomId).emit('presence_update', { userId, isOnline: true });
-      const sockets = await io.in(roomId).fetchSockets();
+    const sockets = await io.in(roomId).fetchSockets();
       const onlineUsers = sockets.map(s => s.data.userId).filter(id => id && id !== userId);
       if (onlineUsers.length > 0) {
         onlineUsers.forEach(partnerId => {
           socket.emit('presence_update', { userId: partnerId, isOnline: true });
         });
       }
+
+      // Send last 30 messages so a rejoining client catches up on anything missed
+      const recent = await Message.find({ roomId })
+          .sort({ timestamp: -1 })
+          .limit(30)
+          .lean();
+      socket.emit('catch_up_messages', recent.reverse());
+
     } catch (e) { console.error("Join Error:", e); }
   });
 
@@ -110,8 +118,19 @@ socket.on('recording', ({ roomId, isRecording }) => {
       const newMsg = new Message(data);
       await newMsg.save();
       await Message.findOneAndUpdate({ docId: data.docId }, { status: 'delivered' });
-      io.to(data.roomId).emit('new_message', data);
+     io.to(data.roomId).emit('new_message', data);
       socket.emit('message_sent', { docId: data.docId, localId: data.localId, status: 'sent' });
+
+      // Instantly tell sender "delivered" if the other person is already in the room
+      const roomSockets = await io.in(data.roomId).fetchSockets();
+      const receiverOnline = roomSockets.some(s => s.data.userId && s.data.userId !== data.senderId);
+      if (receiverOnline) {
+          socket.emit('status_updated', {
+              docId: data.docId,
+              localId: data.localId,
+              status: 'delivered'
+          });
+      }
       try {
         await admin.firestore()
           .collection('rooms').doc(data.roomId || 'room1')
