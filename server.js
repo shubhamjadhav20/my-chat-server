@@ -33,7 +33,12 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/chat_app";
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ Connected to MongoDB"))
   .catch(err => console.error("❌ MongoDB Connection Error:", err));
-
+const VersionSchema = new mongoose.Schema({
+  versionCode: Number,
+  downloadUrl: String,
+  updatedAt: { type: Date, default: Date.now }
+});
+const AppVersion = mongoose.model('AppVersion', VersionSchema);  
 const MessageSchema = new mongoose.Schema({
   docId: { type: String, required: true, unique: true },
   text: String,
@@ -372,6 +377,20 @@ app.get("/api/thumbnail", async (req, res) => {
 app.get("/", (req, res) => {
   res.send("Chat Server Active (Hybrid Mode: Socket + REST) 🚀");
 });
+// This is what AppUpdater.kt will call
+app.get("/update/version.json", async (req, res) => {
+  try {
+    const latest = await AppVersion.findOne().sort({ versionCode: -1 });
+    if (!latest) return res.status(404).json({ error: "No version found" });
+    
+    res.json({
+      latestVersionCode: latest.versionCode,
+      downloadUrl: latest.downloadUrl
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get("/api/messages", async (req, res) => {
   try {
@@ -413,7 +432,21 @@ app.get("/api/messages/search", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+app.post("/api/admin/publish-update", async (req, res) => {
+  const { versionCode, downloadUrl, secret } = req.body;
+  
+  // Simple safety check (change 'my_secret_key' to something else)
+  if (secret !== "my_secret_key") return res.status(401).send("Unauthorized");
 
+  try {
+    const update = new AppVersion({ versionCode, downloadUrl });
+    await update.save();
+    console.log(`🚀 Version ${versionCode} published!`);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 // Batch signed URLs — one round-trip for many files
 app.post("/api/batch-signed-urls", async (req, res) => {
   try {
