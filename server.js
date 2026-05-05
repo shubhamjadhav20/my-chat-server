@@ -118,45 +118,65 @@ socket.on('recording', ({ roomId, isRecording }) => {
   });
 
   socket.on('send_message', async (data) => {
-    try {
-      console.log(`📨 Socket Message from ${data.senderId}`);
-      const newMsg = new Message(data);
-      await newMsg.save();
-      await Message.findOneAndUpdate({ docId: data.docId }, { status: 'delivered' });
-     io.to(data.roomId).emit('new_message', data);
-      socket.emit('message_sent', { docId: data.docId, localId: data.localId, status: 'sent' });
+  try {
+    console.log(`📨 Socket Message from ${data.senderId}`);
+    const newMsg = new Message({ ...data, status: 'sent' });
+    await newMsg.save();
 
-      // Instantly tell sender "delivered" if the other person is already in the room
-      const roomSockets = await io.in(data.roomId).fetchSockets();
-      const receiverOnline = roomSockets.some(s => s.data.userId && s.data.userId !== data.senderId);
-      if (receiverOnline) {
-          socket.emit('status_updated', {
-              docId: data.docId,
-              localId: data.localId,
-              status: 'delivered'
-          });
-      }
-      try {
-        await admin.firestore()
-          .collection('rooms').doc(data.roomId || 'room1')
-          .collection('messages').doc(data.docId)
-          .set({ ...data, status: 'delivered', timestamp: admin.firestore.FieldValue.serverTimestamp() });
-        console.log("✅ Bridged to Firestore");
-      } catch (e) { console.error("Bridge Error:", e.message); }
-      const receiverId = data.senderId === "user1" ? "user2" : "user1";
-      await sendFCM(data.senderId, receiverId, data.text || "New Message");
-    } catch (e) { console.error("Socket Save Error:", e); }
-  });
+    io.to(data.roomId).emit('new_message', data);
+    socket.emit('message_sent', { docId: data.docId, localId: data.localId, status: 'sent' });
+
+    try {
+      await admin.firestore()
+        .collection('rooms').doc(data.roomId || 'room1')
+        .collection('messages').doc(data.docId)
+        .set({ ...data, status: 'sent', timestamp: admin.firestore.FieldValue.serverTimestamp() });
+    } catch (e) { console.error("Bridge Error:", e.message); }
+
+    const receiverId = data.senderId === "user1" ? "user2" : "user1";
+    await sendFCM(data.senderId, receiverId, data.text || "New Message");
+  } catch (e) { console.error("Socket Save Error:", e); }
+});
 
   socket.on('update_status', async ({ docId, status, roomId }) => {
+  try {
     console.log(`🔄 Status Update: ${docId} -> ${status}`);
-    await Message.findOneAndUpdate({ docId }, { status, seen: status === 'seen' });
+    const msg = await Message.findOneAndUpdate(
+      { docId },
+      { status, seen: status === 'seen' },
+      { new: true }
+    );
+
+    if (status === 'seen' && msg?.viewOnce && msg?.mediaUrl) {
+      try {
+        if (!b2Authorized) await authorizeB2();
+        const fileInfo = await b2.listFileNames({
+          bucketId: process.env.B2_BUCKET_ID,
+          startFileName: msg.mediaUrl,
+          maxFileCount: 1
+        });
+        if (
+          fileInfo.data.files?.length > 0 &&
+          fileInfo.data.files[0].fileName === msg.mediaUrl
+        ) {
+          await b2.deleteFileVersion({
+            fileName: msg.mediaUrl,
+            fileId: fileInfo.data.files[0].fileId
+          });
+          console.log(`🗑️ Permanently deleted view-once file: ${msg.mediaUrl}`);
+        }
+      } catch (b2Err) {
+        console.error("❌ B2 Auto-Delete Error:", b2Err.message);
+      }
+    }
+
     io.to(roomId).emit('status_updated', { docId, status });
     try {
       await admin.firestore().collection('rooms').doc(roomId)
         .collection('messages').doc(docId).update({ status, seen: status === 'seen' });
-    } catch(e) {}
-  });
+    } catch (e) {}
+  } catch (e) { console.error("Update Status Error:", e); }
+});
 
   socket.on('typing', ({ roomId, isTyping }) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
@@ -409,7 +429,8 @@ app.get("/api/media", async (req, res) => {
     const { roomId } = req.query;
     const mediaMessages = await Message.find({
       roomId: roomId || "room1",
-      mediaUrl: { $exists: true, $ne: null, $ne: "" }
+      mediaUrl: { $exists: true, $ne: null, $ne: "" },
+      viewOnce: { $ne: true }
     })
       .sort({ timestamp: -1 })
       .select("docId senderId timestamp seen status mediaUrl mediaType viewOnce replyToMessageId replyToText replyToSender text reactions");
