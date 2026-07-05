@@ -38,7 +38,7 @@ const VersionSchema = new mongoose.Schema({
   downloadUrl: String,
   updatedAt: { type: Date, default: Date.now }
 });
-const AppVersion = mongoose.model('AppVersion', VersionSchema);  
+const AppVersion = mongoose.model('AppVersion', VersionSchema);
 const MessageSchema = new mongoose.Schema({
   docId: { type: String, required: true, unique: true },
   text: String,
@@ -49,6 +49,10 @@ const MessageSchema = new mongoose.Schema({
   mediaUrl: String,
   mediaType: String,
   viewOnce: { type: Boolean, default: false },
+  // Set once the recipient has opened a view-once photo/video and the B2 file
+  // has been purged. mediaUrl is cleared to null at the same time — this flag
+  // just lets clients tell "never had media" apart from "media was viewed".
+  viewOnceConsumed: { type: Boolean, default: false },
   replyToMessageId: String,
   replyToText: String,
   replyToSender: String,
@@ -118,65 +122,45 @@ socket.on('recording', ({ roomId, isRecording }) => {
   });
 
   socket.on('send_message', async (data) => {
-  try {
-    console.log(`📨 Socket Message from ${data.senderId}`);
-    const newMsg = new Message({ ...data, status: 'sent' });
-    await newMsg.save();
-
-    io.to(data.roomId).emit('new_message', data);
-    socket.emit('message_sent', { docId: data.docId, localId: data.localId, status: 'sent' });
-
     try {
-      await admin.firestore()
-        .collection('rooms').doc(data.roomId || 'room1')
-        .collection('messages').doc(data.docId)
-        .set({ ...data, status: 'sent', timestamp: admin.firestore.FieldValue.serverTimestamp() });
-    } catch (e) { console.error("Bridge Error:", e.message); }
+      console.log(`📨 Socket Message from ${data.senderId}`);
+      const newMsg = new Message(data);
+      await newMsg.save();
+      await Message.findOneAndUpdate({ docId: data.docId }, { status: 'delivered' });
+     io.to(data.roomId).emit('new_message', data);
+      socket.emit('message_sent', { docId: data.docId, localId: data.localId, status: 'sent' });
 
-    const receiverId = data.senderId === "user1" ? "user2" : "user1";
-    await sendFCM(data.senderId, receiverId, data.text || "New Message");
-  } catch (e) { console.error("Socket Save Error:", e); }
-});
+      // Instantly tell sender "delivered" if the other person is already in the room
+      const roomSockets = await io.in(data.roomId).fetchSockets();
+      const receiverOnline = roomSockets.some(s => s.data.userId && s.data.userId !== data.senderId);
+      if (receiverOnline) {
+          socket.emit('status_updated', {
+              docId: data.docId,
+              localId: data.localId,
+              status: 'delivered'
+          });
+      }
+      try {
+        await admin.firestore()
+          .collection('rooms').doc(data.roomId || 'room1')
+          .collection('messages').doc(data.docId)
+          .set({ ...data, status: 'delivered', timestamp: admin.firestore.FieldValue.serverTimestamp() });
+        console.log("✅ Bridged to Firestore");
+      } catch (e) { console.error("Bridge Error:", e.message); }
+      const receiverId = data.senderId === "user1" ? "user2" : "user1";
+      await sendFCM(data.senderId, receiverId, data.text || "New Message");
+    } catch (e) { console.error("Socket Save Error:", e); }
+  });
 
   socket.on('update_status', async ({ docId, status, roomId }) => {
-  try {
     console.log(`🔄 Status Update: ${docId} -> ${status}`);
-    const msg = await Message.findOneAndUpdate(
-      { docId },
-      { status, seen: status === 'seen' },
-      { new: true }
-    );
-
-    if (status === 'seen' && msg?.viewOnce && msg?.mediaUrl) {
-      try {
-        if (!b2Authorized) await authorizeB2();
-        const fileInfo = await b2.listFileNames({
-          bucketId: process.env.B2_BUCKET_ID,
-          startFileName: msg.mediaUrl,
-          maxFileCount: 1
-        });
-        if (
-          fileInfo.data.files?.length > 0 &&
-          fileInfo.data.files[0].fileName === msg.mediaUrl
-        ) {
-          await b2.deleteFileVersion({
-            fileName: msg.mediaUrl,
-            fileId: fileInfo.data.files[0].fileId
-          });
-          console.log(`🗑️ Permanently deleted view-once file: ${msg.mediaUrl}`);
-        }
-      } catch (b2Err) {
-        console.error("❌ B2 Auto-Delete Error:", b2Err.message);
-      }
-    }
-
+    await Message.findOneAndUpdate({ docId }, { status, seen: status === 'seen' });
     io.to(roomId).emit('status_updated', { docId, status });
     try {
       await admin.firestore().collection('rooms').doc(roomId)
         .collection('messages').doc(docId).update({ status, seen: status === 'seen' });
-    } catch (e) {}
-  } catch (e) { console.error("Update Status Error:", e); }
-});
+    } catch(e) {}
+  });
 
   socket.on('typing', ({ roomId, isTyping }) => {
     socket.to(roomId).emit('partner_typing', { userId: socket.userId, isTyping });
@@ -332,6 +316,25 @@ async function downloadFromB2(fileName) {
   return Buffer.from(await response.arrayBuffer());
 }
 
+// Permanently delete a file from B2 by name. B2's delete API needs the exact
+// fileId of the version to remove, so we look it up first via listFileVersions
+// (startFileName narrows the listing to just this name) and match the exact
+// fileName — chat_media/* names already carry a UUID, so collisions aren't a
+// concern, this is just how the B2 API requires the call to be shaped.
+async function deleteFromB2(fileName) {
+  if (!b2Authorized) await authorizeB2();
+  const versions = await b2.listFileVersions({
+    bucketId: process.env.B2_BUCKET_ID,
+    startFileName: fileName,
+    maxFileCount: 5,
+  });
+  const matches = (versions.data.files || []).filter(f => f.fileName === fileName);
+  for (const file of matches) {
+    await b2.deleteFileVersion({ fileId: file.fileId, fileName: file.fileName });
+  }
+  return matches.length;
+}
+
 // ============================================================================
 // 4. THUMBNAIL ENDPOINT  🖼️ → saves B2 bandwidth
 //
@@ -402,7 +405,7 @@ app.get("/update/version.json", async (req, res) => {
   try {
     const latest = await AppVersion.findOne().sort({ versionCode: -1 });
     if (!latest) return res.status(404).json({ error: "No version found" });
-    
+
     res.json({
       latestVersionCode: latest.versionCode,
       downloadUrl: latest.downloadUrl
@@ -429,11 +432,10 @@ app.get("/api/media", async (req, res) => {
     const { roomId } = req.query;
     const mediaMessages = await Message.find({
       roomId: roomId || "room1",
-      mediaUrl: { $exists: true, $ne: null, $ne: "" },
-      viewOnce: { $ne: true }
+      mediaUrl: { $exists: true, $ne: null, $ne: "" }
     })
       .sort({ timestamp: -1 })
-      .select("docId senderId timestamp seen status mediaUrl mediaType viewOnce replyToMessageId replyToText replyToSender text reactions");
+      .select("docId senderId timestamp seen status mediaUrl mediaType viewOnce viewOnceConsumed replyToMessageId replyToText replyToSender text reactions");
     res.json(mediaMessages);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -455,7 +457,7 @@ app.get("/api/messages/search", async (req, res) => {
 });
 app.post("/api/admin/publish-update", async (req, res) => {
   const { versionCode, downloadUrl, secret } = req.body;
-  
+
   // Simple safety check (change 'my_secret_key' to something else)
   if (secret !== "my_secret_key") return res.status(401).send("Unauthorized");
 
@@ -534,6 +536,60 @@ app.post("/api/messages/delete-batch", async (req, res) => {
     res.json({ success: true, deleted: result.deletedCount });
   } catch (e) {
     console.error("delete-batch error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================================
+// View-once consume — called the moment the recipient closes the full-screen
+// viewer after opening a view-once photo/video. Permanently deletes the file
+// from B2 and clears mediaUrl on the message, then broadcasts to the room so
+// both devices flip the bubble to "Opened · gone" in real time.
+//
+// Idempotent: if it's already consumed, this is a no-op success (protects
+// against a double-fire from a flaky network retry).
+// ============================================================================
+app.post("/api/messages/view-once-consume", async (req, res) => {
+  try {
+    const { docId, roomId } = req.body;
+    if (!docId) return res.status(400).json({ error: "docId required" });
+    const room = roomId || "room1";
+
+    const msg = await Message.findOne({ docId, roomId: room });
+    if (!msg) return res.status(404).json({ error: "Not found" });
+    if (!msg.viewOnce) return res.status(400).json({ error: "Not a view-once message" });
+
+    if (msg.viewOnceConsumed) {
+      return res.json({ success: true, alreadyConsumed: true });
+    }
+
+    if (msg.mediaUrl) {
+      try {
+        const deletedCount = await deleteFromB2(msg.mediaUrl);
+        console.log(`🔥 View-once purge: deleted ${deletedCount} B2 version(s) of ${msg.mediaUrl}`);
+      } catch (b2Err) {
+        // Non-fatal — still mark it consumed so the UI doesn't get stuck
+        // showing a re-viewable placeholder. Log loudly so an orphaned B2
+        // file doesn't go unnoticed.
+        console.error(`❌ B2 delete failed for ${msg.mediaUrl}:`, b2Err.message);
+      }
+    }
+
+    await Message.findOneAndUpdate({ docId }, { mediaUrl: null, viewOnceConsumed: true });
+
+    try {
+      await admin.firestore().collection('rooms').doc(room)
+        .collection('messages').doc(docId)
+        .update({ mediaUrl: null, viewOnceConsumed: true });
+    } catch (fsErr) {
+      console.error("Firestore view-once mirror update failed (non-fatal):", fsErr.message);
+    }
+
+    io.to(room).emit('view_once_consumed', { docId });
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("view-once-consume error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -623,7 +679,7 @@ app.post("/sendCallNotification", async (req, res) => {
     const { callerId, calleeId, callType, callId } = req.body;
     const tokenDoc = await admin.firestore().collection("fcm_tokens").doc(calleeId).get();
     if (!tokenDoc.exists) return res.json({ success: false, error: "No token" });
-    
+
     const callerName = callerId === "user1" ? "Shubham" : "Prachiti";
     const payload = {
       token: tokenDoc.data().token,
@@ -634,7 +690,7 @@ app.post("/sendCallNotification", async (req, res) => {
       data: { type: "incoming_call", callerId, calleeId, callType, callId, callerName },
       android: { priority: "high" }
     };
-    
+
     await admin.messaging().send(payload);
     res.json({ success: true });
   } catch (error) {
