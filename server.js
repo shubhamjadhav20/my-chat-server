@@ -81,7 +81,14 @@ const Message = mongoose.model('Message', MessageSchema);
 const User = mongoose.model('User', UserSchema);
 
 const httpServer = createServer(app);
-const io = new Server(httpServer, { cors: { origin: "*" } });
+// pingInterval/pingTimeout control how fast a dead connection (signal drop, tunnel,
+// airplane mode — no TCP FIN) is noticed. Socket.IO defaults are 25s + 20s (~45s of
+// ghost "online"); 10s + 10s caps it at ~20s. The client adopts these from the handshake.
+const io = new Server(httpServer, {
+  cors: { origin: "*" },
+  pingInterval: 10000,
+  pingTimeout: 10000,
+});
 
 // ============================================================================
 // SOCKET.IO LOGIC
@@ -109,6 +116,18 @@ socket.on('recording', ({ roomId, isRecording }) => {
         onlineUsers.forEach(partnerId => {
           socket.emit('presence_update', { userId: partnerId, isOnline: true });
         });
+      } else {
+        // Partner is not connected: tell the joining client explicitly, with their
+        // last-seen time. Without this a client that reconnects keeps showing whatever
+        // presence it had before (stale "online") and has no last-seen to display.
+        const partner = await User.findOne({ userId: { $ne: userId } }).lean();
+        if (partner) {
+          socket.emit('presence_update', {
+            userId: partner.userId,
+            isOnline: false,
+            lastSeen: partner.lastSeen || null,
+          });
+        }
       }
 
       // Send last 30 messages so a rejoining client catches up on anything missed
@@ -240,8 +259,9 @@ socket.on('ice_candidate', ({ callId, candidate, sdpMid, sdpMLineIndex, roomId }
       const sockets = await io.fetchSockets();
       const remaining = sockets.filter(s => s.data.userId === socket.userId && s.id !== socket.id);
       if (remaining.length > 0) return;
-      await User.findOneAndUpdate({ userId: socket.userId }, { isOnline: false, lastSeen: Date.now() });
-      io.emit('presence_update', { userId: socket.userId, isOnline: false });
+      const lastSeen = Date.now();
+      await User.findOneAndUpdate({ userId: socket.userId }, { isOnline: false, lastSeen });
+      io.emit('presence_update', { userId: socket.userId, isOnline: false, lastSeen });
       console.log(`🔴 User ${socket.userId} is now truly OFFLINE.`);
     }
   });
@@ -480,9 +500,13 @@ app.get("/api/messages/search", async (req, res) => {
   try {
     const { roomId, q } = req.query;
     if (!q || q.length < 2) return res.json([]);
+    // The query is plain text, not a regex. Unescaped, characters like ( [ * + ? made MongoDB
+    // throw "invalid regular expression" (-> HTTP 500, search silently returned nothing)
+    // or match the wrong thing (e.g. "what?" matching "wha").
+    const escaped = String(q).slice(0, 100).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const results = await Message.find({
       roomId: roomId || "room1",
-      text: { $regex: q, $options: "i" }
+      text: { $regex: escaped, $options: "i" }
     }).sort({ timestamp: -1 }).limit(50);
     res.json(results);
   } catch (e) {
