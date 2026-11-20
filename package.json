@@ -4,7 +4,8 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/security.test.mjs"
   },
   "dependencies": {
     "backblaze-b2": "^1.7.1",

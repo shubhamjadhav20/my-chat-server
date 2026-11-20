@@ -1,6 +1,7 @@
 import express from "express";
 import admin from "firebase-admin";
-import cors from "cors";
+import { createApiGuard, safeEqual } from "./security.js";
+import { resolveDownloadUrl, validatePublishBody } from "./updates.js";
 import B2 from "backblaze-b2";
 import mongoose from "mongoose";
 import { createServer } from "http";
@@ -13,8 +14,29 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable("x-powered-by");
+// No CORS: the only client is the native Android app, which doesn't use it. (CORS is a
+// browser mechanism; leaving it open only let arbitrary websites talk to this API.)
+app.use(express.json({ limit: "256kb" }));
+
+// ============================================================================
+// SECURITY — secrets live in environment variables, never in source control.
+//   API_KEY          shared key the app sends (x-api-key header / socket auth)
+//   ENFORCE_API_KEY  "true" = reject keyless callers; otherwise they are only logged
+//   ADMIN_SECRET     protects /api/admin/publish-update
+// See .env.example. With API_KEY unset the API stays open, as before.
+// ============================================================================
+const apiGuard = createApiGuard({
+  apiKey: process.env.API_KEY,
+  enforce: process.env.ENFORCE_API_KEY === "true",
+});
+app.use(apiGuard.http);
+console.log(`🔐 API key mode: ${apiGuard.mode}` +
+  (apiGuard.mode === "off" ? " (set API_KEY to turn authentication on)" : ""));
+if (!process.env.ADMIN_SECRET) console.warn("⚠️ ADMIN_SECRET is not set — publish-update is disabled");
+for (const name of ["MONGO_URI", "SERVICE_ACCOUNT_BASE64", "B2_KEY_ID", "B2_APPLICATION_KEY", "B2_BUCKET_ID", "B2_BUCKET_NAME"]) {
+  if (!process.env[name]) console.warn(`⚠️ Missing environment variable: ${name}`);
+}
 
 // ============================================================================
 // THUMBNAIL CACHE DIRECTORY
@@ -35,7 +57,8 @@ mongoose.connect(MONGO_URI)
   .catch(err => console.error("❌ MongoDB Connection Error:", err));
 const VersionSchema = new mongoose.Schema({
   versionCode: Number,
-  downloadUrl: String,
+  downloadUrl: String,   // full URL, or a file name in the private B2 bucket (signed on request)
+  sha256: String,        // optional; the app verifies the download against it
   updatedAt: { type: Date, default: Date.now }
 });
 const AppVersion = mongoose.model('AppVersion', VersionSchema);
@@ -85,10 +108,11 @@ const httpServer = createServer(app);
 // airplane mode — no TCP FIN) is noticed. Socket.IO defaults are 25s + 20s (~45s of
 // ghost "online"); 10s + 10s caps it at ~20s. The client adopts these from the handshake.
 const io = new Server(httpServer, {
-  cors: { origin: "*" },
+  cors: { origin: false },
   pingInterval: 10000,
   pingTimeout: 10000,
 });
+io.use(apiGuard.socket);
 
 // ============================================================================
 // SOCKET.IO LOGIC
@@ -330,6 +354,18 @@ async function withB2Retry(fn) {
   }
 }
 
+// Signed download link for a private B2 file, valid for `validSeconds`.
+async function createSignedUrl(fileName, validSeconds) {
+  return withB2Retry(async () => {
+    const downloadAuth = await b2.getDownloadAuthorization({
+      bucketId: process.env.B2_BUCKET_ID,
+      fileNamePrefix: fileName,
+      validDurationInSeconds: validSeconds,
+    });
+    return `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
+  });
+}
+
 // ============================================================================
 // 3. SHARED HELPERS
 // ============================================================================
@@ -460,12 +496,17 @@ app.get("/update/version.json", async (req, res) => {
     const latest = await AppVersion.findOne().sort({ versionCode: -1 });
     if (!latest) return res.status(404).json({ error: "No version found" });
 
+    // If the stored value is a B2 file name, hand out a fresh 1-hour download link now.
+    // (A link stored at publish time would expire; this one never goes stale.)
+    const downloadUrl = await resolveDownloadUrl(latest.downloadUrl, (name) => createSignedUrl(name, 3600));
     res.json({
       latestVersionCode: latest.versionCode,
-      downloadUrl: latest.downloadUrl
+      downloadUrl,
+      ...(latest.sha256 ? { sha256: latest.sha256 } : {}),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("version.json error:", e.message);
+    res.status(500).json({ error: "Could not resolve update" });
   }
 });
 
@@ -514,18 +555,22 @@ app.get("/api/messages/search", async (req, res) => {
   }
 });
 app.post("/api/admin/publish-update", async (req, res) => {
-  const { versionCode, downloadUrl, secret } = req.body;
+  // Fails closed: with no ADMIN_SECRET configured nobody can publish. Constant-time compare.
+  const adminSecret = process.env.ADMIN_SECRET;
+  if (!adminSecret) return res.status(503).json({ error: "Publishing is disabled (ADMIN_SECRET not set)" });
+  const provided = req.get("x-admin-secret") ?? req.body?.secret;
+  if (!safeEqual(provided, adminSecret)) return res.status(401).send("Unauthorized");
 
-  // Simple safety check (change 'my_secret_key' to something else)
-  if (secret !== "my_secret_key") return res.status(401).send("Unauthorized");
+  const checked = validatePublishBody(req.body ?? {});
+  if (checked.error) return res.status(400).json({ error: checked.error });
 
   try {
-    const update = new AppVersion({ versionCode, downloadUrl });
-    await update.save();
-    console.log(`🚀 Version ${versionCode} published!`);
-    res.json({ success: true });
+    await new AppVersion(checked.value).save();
+    console.log(`🚀 Version ${checked.value.versionCode} published!`);
+    res.json({ success: true, versionCode: checked.value.versionCode });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error("publish-update error:", e.message);
+    res.status(500).json({ error: "Could not publish" });
   }
 });
 // Batch signed URLs — one round-trip for many files
