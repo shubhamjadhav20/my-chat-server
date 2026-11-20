@@ -263,12 +263,15 @@ const b2 = new B2({
 
 let b2Authorized = false;
 let authorizationData = null;
+let b2AuthorizedAt = 0;
+const B2_AUTH_MAX_AGE_MS = 23 * 60 * 60 * 1000; // B2 account auth tokens expire ~24h
 
 async function authorizeB2() {
   try {
     const response = await b2.authorize();
     b2Authorized = true;
     authorizationData = response.data;
+    b2AuthorizedAt = Date.now();
     console.log("✅ Backblaze B2 authorized successfully");
     return true;
   } catch (error) {
@@ -277,6 +280,35 @@ async function authorizeB2() {
   }
 }
 authorizeB2();
+
+// b2Authorized used to be a one-way flag — set true on first boot and never
+// reset, so once the B2 auth token aged out (~24h) every call using it kept
+// silently 401ing forever on a long-running dyno (e.g. after weeks of uptime
+// with no restart), which is what broke every image/thumbnail/signed URL.
+// This proactively re-authorizes on staleness, and is paired with a 401
+// retry below for calls that find a token invalidated earlier than expected.
+async function ensureB2Auth() {
+  if (!b2Authorized || Date.now() - b2AuthorizedAt > B2_AUTH_MAX_AGE_MS) {
+    await authorizeB2();
+  }
+}
+
+// Runs a B2 call, re-authorizing and retrying once if the token turns out
+// to already be invalid (401) despite looking fresh by our own clock.
+async function withB2Retry(fn) {
+  await ensureB2Auth();
+  try {
+    return await fn();
+  } catch (error) {
+    const status = error?.response?.status || error?.status;
+    if (status === 401) {
+      console.warn("⚠️ B2 call got 401 — re-authorizing and retrying once");
+      await authorizeB2();
+      return await fn();
+    }
+    throw error;
+  }
+}
 
 // ============================================================================
 // 3. SHARED HELPERS
@@ -304,16 +336,17 @@ async function sendFCM(senderId, receiverId, messageText) {
 
 // Download a file from B2 using a short-lived signed URL (internal server use only)
 async function downloadFromB2(fileName) {
-  if (!b2Authorized) await authorizeB2();
-  const downloadAuth = await b2.getDownloadAuthorization({
-    bucketId: process.env.B2_BUCKET_ID,
-    fileNamePrefix: fileName,
-    validDurationInSeconds: 300, // 5 min — only needed for the duration of download
+  return withB2Retry(async () => {
+    const downloadAuth = await b2.getDownloadAuthorization({
+      bucketId: process.env.B2_BUCKET_ID,
+      fileNamePrefix: fileName,
+      validDurationInSeconds: 300, // 5 min — only needed for the duration of download
+    });
+    const signedUrl = `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
+    const response = await fetch(signedUrl);
+    if (!response.ok) throw new Error(`B2 download failed: ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
   });
-  const signedUrl = `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
-  const response = await fetch(signedUrl);
-  if (!response.ok) throw new Error(`B2 download failed: ${response.status}`);
-  return Buffer.from(await response.arrayBuffer());
 }
 
 // Permanently delete a file from B2 by name. B2's delete API needs the exact
@@ -322,17 +355,18 @@ async function downloadFromB2(fileName) {
 // fileName — chat_media/* names already carry a UUID, so collisions aren't a
 // concern, this is just how the B2 API requires the call to be shaped.
 async function deleteFromB2(fileName) {
-  if (!b2Authorized) await authorizeB2();
-  const versions = await b2.listFileVersions({
-    bucketId: process.env.B2_BUCKET_ID,
-    startFileName: fileName,
-    maxFileCount: 5,
+  return withB2Retry(async () => {
+    const versions = await b2.listFileVersions({
+      bucketId: process.env.B2_BUCKET_ID,
+      startFileName: fileName,
+      maxFileCount: 5,
+    });
+    const matches = (versions.data.files || []).filter(f => f.fileName === fileName);
+    for (const file of matches) {
+      await b2.deleteFileVersion({ fileId: file.fileId, fileName: file.fileName });
+    }
+    return matches.length;
   });
-  const matches = (versions.data.files || []).filter(f => f.fileName === fileName);
-  for (const file of matches) {
-    await b2.deleteFileVersion({ fileId: file.fileId, fileName: file.fileName });
-  }
-  return matches.length;
 }
 
 // ============================================================================
@@ -477,16 +511,18 @@ app.post("/api/batch-signed-urls", async (req, res) => {
     if (!Array.isArray(fileNames) || fileNames.length === 0) {
       return res.status(400).json({ error: "fileNames array required" });
     }
-    if (!b2Authorized) await authorizeB2();
+    await ensureB2Auth();
     const results = await Promise.all(
       fileNames.map(async (fileName) => {
         try {
-          const downloadAuth = await b2.getDownloadAuthorization({
-            bucketId: process.env.B2_BUCKET_ID,
-            fileNamePrefix: fileName,
-            validDurationInSeconds: 86400,
+          const signedUrl = await withB2Retry(async () => {
+            const downloadAuth = await b2.getDownloadAuthorization({
+              bucketId: process.env.B2_BUCKET_ID,
+              fileNamePrefix: fileName,
+              validDurationInSeconds: 86400,
+            });
+            return `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
           });
-          const signedUrl = `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
           return { fileName, signedUrl };
         } catch (e) {
           console.error(`Failed URL for ${fileName}: ${e.message}`);
@@ -733,13 +769,14 @@ app.post("/getSignedUrl", async (req, res) => {
   try {
     const { fileName } = req.body;
     if (!fileName) return res.status(400).json({ success: false, error: "fileName required" });
-    if (!b2Authorized) await authorizeB2();
-    const downloadAuth = await b2.getDownloadAuthorization({
-      bucketId: process.env.B2_BUCKET_ID,
-      fileNamePrefix: fileName,
-      validDurationInSeconds: 86400,
+    const signedUrl = await withB2Retry(async () => {
+      const downloadAuth = await b2.getDownloadAuthorization({
+        bucketId: process.env.B2_BUCKET_ID,
+        fileNamePrefix: fileName,
+        validDurationInSeconds: 86400,
+      });
+      return `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
     });
-    const signedUrl = `${authorizationData.downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}?Authorization=${downloadAuth.data.authorizationToken}`;
     res.json({ success: true, signedUrl });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
